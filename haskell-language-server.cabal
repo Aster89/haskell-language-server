@@ -529,7 +529,7 @@ test-suite hls-eval-plugin-tests
 flag importLens
   description: Enable importLens plugin
   default:     True
-  manual:      False
+  manual:      True
 
 common importLens
   if flag(importLens)
@@ -547,6 +547,41 @@ library hls-explicit-imports-plugin
     , containers
     , deepseq
     , ghc
+    , ghcide                == 2.13.0.0
+    , hls-graph
+    , hls-plugin-api        == 2.13.0.0
+    , lens
+    , lsp
+    , mtl
+    , text
+    , transformers
+
+  default-extensions:
+    DataKinds
+
+flag caseSplit
+  description: Enable caseSplit plugin
+  default:     True
+  manual:      True
+
+common caseSplit
+  if flag(caseSplit)
+    build-depends: haskell-language-server:hls-case-split-plugin
+    cpp-options: -Dhls_caseSplit
+
+library hls-case-split-plugin
+  import:           defaults, pedantic, warnings
+  if !flag(casesplit)
+    buildable: False
+  exposed-modules:  Ide.Plugin.CaseSplit
+  hs-source-dirs:   plugins/hls-case-split-plugin/src
+  build-depends:
+    , aeson
+    , containers
+    , deepseq
+    , extra
+    , ghc
+    , ghc-exactprint
     , ghcide                == 2.13.0.0
     , hls-graph
     , hls-plugin-api        == 2.13.0.0
@@ -1852,6 +1887,7 @@ library
                   , class
                   , eval
                   , importLens
+                  , caseSplit
                   , rename
                   , retrie
                   , hlint
