@@ -9,14 +9,11 @@
 
 module Ide.Plugin.CaseSplit
   ( descriptor
-  , descriptorForModules
-  , abbreviateImportTitle
-  , abbreviateImportTitleWithoutModule
   , Log(..)
   ) where
 
 import           Control.DeepSeq
-import           Control.Lens                         (_Just, (&), (?~), (^?))
+import           Control.Lens                         ((&), (?~))
 import           Control.Monad.Error.Class            (MonadError (throwError))
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Class            (lift)
@@ -24,18 +21,14 @@ import           Control.Monad.Trans.Except           (ExceptT)
 import           Control.Monad.Trans.Maybe
 import qualified Data.Aeson                           as A (ToJSON (toJSON))
 import           Data.Aeson.Types                     (FromJSON)
-import           Data.Char                            (isSpace)
 import qualified Data.IntMap                          as IM (IntMap, elems,
                                                              fromList, (!?))
 import           Data.IORef                           (readIORef)
-import           Data.List                            (singleton)
 import qualified Data.Map.Strict                      as Map
-import           Data.Maybe                           (isJust, isNothing,
+import           Data.Maybe                           (isNothing,
                                                        mapMaybe)
 import qualified Data.Set                             as S
-import           Data.String                          (fromString)
 import qualified Data.Text                            as T
-import qualified Data.Text                            as Text
 import           Data.Traversable                     (for)
 import qualified Data.Unique                          as U (hashUnique,
                                                             newUnique)
@@ -54,10 +47,7 @@ import qualified Ide.Plugin.RangeMap                  as RM (RangeMap,
                                                              filterByRange,
                                                              fromList)
 import           Ide.Plugin.Resolve
-import           Ide.PluginUtils
 import           Ide.Types
-import           Language.LSP.Protocol.Lens           (HasInlayHint (inlayHint),
-                                                       HasTextDocument (textDocument))
 import qualified Language.LSP.Protocol.Lens           as L
 import           Language.LSP.Protocol.Message
 import           Language.LSP.Protocol.Types
@@ -66,8 +56,8 @@ import           Language.LSP.Protocol.Types
 -- providing code actions and lenses to make imports explicit it also provides
 -- code actions and lens to refine imports.
 
-importCommandId :: CommandId
-importCommandId = "CaseSplitCommand"
+cmdId :: CommandId
+cmdId = "CaseSplitCommand"
 
 data Log
   = LogShake Shake.Log
@@ -83,39 +73,17 @@ instance Pretty Log where
 
 -- | The "main" function of a plugin
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
-descriptor recorder =
-    -- (almost) no one wants to see an explicit import list for Prelude
-    descriptorForModules recorder (/= pRELUDE_NAME)
-
-descriptorForModules
-    :: Recorder (WithPriority Log)
-    -> (ModuleName -> Bool)
-      -- ^ Predicate to select modules that will be annotated
-    -> PluginId
-    -> PluginDescriptor IdeState
-descriptorForModules recorder modFilter plId =
+descriptor recorder plId =
   let resolveRecorder = cmapWithPrio LogResolve recorder
       codeActionHandlers = mkCodeActionHandlerWithResolve resolveRecorder (codeActionProvider recorder) (codeActionResolveProvider recorder)
   in (defaultPluginDescriptor plId "Provides a code action to do case splitting")
     {
       -- This plugin provides a command handler
-      pluginCommands = [PluginCommand importCommandId "Case split command" (runImportCommand recorder)],
+      pluginCommands = [PluginCommand cmdId "Case split command" (runImportCommand recorder)],
       -- This plugin defines a new rule
-      pluginRules = minimalImportsRule recorder modFilter,
-      pluginHandlers =
-         -- This plugin provides code lenses
-           mkPluginHandler SMethod_TextDocumentCodeLens (lensProvider recorder)
-        <> mkResolveHandler SMethod_CodeLensResolve (lensResolveProvider recorder)
-        -- This plugin provides inlay hints
-        <> mkPluginHandler SMethod_TextDocumentInlayHint (inlayHintProvider recorder)
-        -- This plugin provides code actions
-        <> codeActionHandlers
+      pluginRules = minimalImportsRule recorder,
+      pluginHandlers = codeActionHandlers
     }
-
-isInlayHintsSupported :: IdeState -> Bool
-isInlayHintsSupported ideState =
-  let clientCaps = Shake.clientCapabilities $ shakeExtras ideState
-   in isJust $ clientCaps ^? textDocument . _Just . inlayHint . _Just
 
 -- | The actual command handler
 runImportCommand :: Recorder (WithPriority Log) -> CommandFunction IdeState IAResolveData
@@ -130,112 +98,6 @@ runImportCommand recorder ideState _ eird@(ResolveOne _ _) = do
 runImportCommand _ _ _ rd = do
   throwError $ PluginInvalidParams (T.pack $ "Unexpected argument for command handler:" <> show rd)
 
-
--- | We provide two code lenses for imports. The first lens makes imports
--- explicit. For example, for the module below:
--- > import Data.List
--- > f = intercalate " " . sortBy length
--- the provider should produce one code lens associated to the import statement:
--- > import Data.List (intercalate, sortBy)
---
--- The second one allows us to import functions directly from the original
--- module. For example, for the following import
--- > import Random.ReExporting.Module (liftIO)
--- the provider should produce one code lens associated to the import statement:
--- > Refine imports to import Control.Monad.IO.Class (liftIO)
-lensProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeLens
-lensProvider _ state _ CodeLensParams {_textDocument = TextDocumentIdentifier {_uri}} = do
-    nfp <- getNormalizedFilePathE _uri
-    (ImportActionsResult{forLens}, pm) <- runActionE "ImportActions" state $ useWithStaleE ImportActions nfp
-    let lens = [ generateLens _uri newRange int
-               -- provide ExplicitImport only if the client does not support inlay hints
-               | not (isInlayHintsSupported state)
-               , (range, (int, ExplicitImport)) <- forLens
-               , Just newRange <- [toCurrentRange pm range]] <>
-               -- RefineImport is always provided because inlay hints cannot
-               [ generateLens _uri newRange int
-               | (range, (int, RefineImport)) <- forLens
-               , Just newRange <- [toCurrentRange pm range]]
-    pure $ InL lens
-  where -- because these are non resolved lenses we only need the range and a
-        -- unique id to later resolve them with. These are for both refine
-        -- import lenses and for explicit import lenses.
-        generateLens :: Uri  -> Range -> Int -> CodeLens
-        generateLens uri range int =
-          CodeLens { _data_ = Just $ A.toJSON $ ResolveOne uri int
-                   , _range = range
-                   , _command = Nothing }
-
-
-lensResolveProvider :: Recorder (WithPriority Log) -> ResolveFunction IdeState IAResolveData 'Method_CodeLensResolve
-lensResolveProvider _ ideState plId cl uri rd@(ResolveOne _ uid) = do
-    nfp <- getNormalizedFilePathE uri
-    (ImportActionsResult{forResolve}, _) <- runActionE "ImportActions" ideState $ useWithStaleE ImportActions nfp
-    target <- handleMaybe PluginStaleResolve $ forResolve IM.!? uid
-    let updatedCodeLens = cl & L.command ?~ mkCommand plId target
-    pure updatedCodeLens
-  where mkCommand ::  PluginId -> ImportEdit -> Command
-        mkCommand pId (ImportEdit{ieResType, ieText}) =
-          let -- The only new thing we need to provide to resolve a lens is the
-              -- title, as the unique Id is the same to resolve the lens title
-              -- as it is to apply the lens through a command.
-              -- The title is written differently depending on what type of lens
-              -- it is.
-              title ExplicitImport = abbreviateImportTitle ieText
-              title RefineImport = "Refine imports to " <> T.intercalate ", " (T.lines ieText)
-          in mkLspCommand pId importCommandId (title ieResType) (Just [A.toJSON rd])
-lensResolveProvider _ _ _ _ _ rd = do
-   throwError $ PluginInvalidParams (T.pack $ "Unexpected argument for lens resolve handler: " <> show rd)
-
-
--- | Provide explicit imports in inlay hints.
--- Applying textEdits can make the import explicit.
--- There is currently no need to resolve inlay hints,
--- as no tooltips or commands are provided in the label.
-inlayHintProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentInlayHint
-inlayHintProvider _ state _ InlayHintParams {_textDocument = TextDocumentIdentifier {_uri}, _range = visibleRange} =
-    if isInlayHintsSupported state
-    then do
-        nfp <- getNormalizedFilePathE _uri
-        (ImportActionsResult {forLens, forResolve}, pm) <- runActionE "ImportActions" state $ useWithStaleE ImportActions nfp
-        let inlayHints = [ inlayHint
-                         | (range, (int, _)) <- forLens
-                         , Just newRange <- [toCurrentRange pm range]
-                         , isSubrangeOf newRange visibleRange
-                         , Just ie <- [forResolve IM.!? int]
-                         , Just inlayHint <- [generateInlayHints newRange ie pm]]
-        pure $ InL inlayHints
-    -- When the client does not support inlay hints, fallback to the code lens,
-    -- so there is nothing to response here.
-    -- `[]` is no different from `null`, we chose to use all `[]` to indicate "no information"
-    else pure $ InL []
-  where
-    -- The appropriate and intended position for the hint hints to begin
-    -- is the end of the range for the code lens.
-    --   import Data.Char (isSpace)
-    --   |--- range ----|-- IH ---|
-    --                  |^-_paddingLeft
-    --                  ^-_position
-    generateInlayHints :: Range -> ImportEdit -> PositionMapping -> Maybe InlayHint
-    generateInlayHints (Range _ end) ie pm = do
-      label <- mkLabel ie
-      currentEnd <- toCurrentPosition pm end
-      return InlayHint { _position = currentEnd
-                       , _label = InL label
-                       , _kind = Nothing -- neither a type nor a parameter
-                       , _textEdits = fmap singleton $ toTEdit pm ie
-                       , _tooltip = Just $ InL "Make this import explicit foobar" -- simple enough, no need to resolve
-                       , _paddingLeft = Just True -- show an extra space before the inlay hint
-                       , _paddingRight = Nothing
-                       , _data_ = Nothing
-                       }
-    mkLabel :: ImportEdit -> Maybe T.Text
-    mkLabel (ImportEdit{ieResType, ieText}) =
-      let title ExplicitImport = Just $ abbreviateImportTitleWithoutModule ieText
-          title RefineImport   = Nothing -- does not provide imports statements that can be refined via inlay hints
-      in title ieResType
-
-
 -- |For explicit imports: If there are any implicit imports, provide both one
 -- code action per import to make that specific import explicit, and one code
 -- action to turn them all into explicit imports. For refine imports: If there
@@ -248,7 +110,7 @@ codeActionProvider _ ideState _pId (CodeActionParams _ _ TextDocumentIdentifier 
     newRange <- toCurrentRangeE pm range
     let relevantCodeActions = RM.filterByRange newRange forCodeActions
         allExplicit =
-          [InR $ mkCodeAction "Make all imports explicit" (Just $ A.toJSON $ ExplicitAll _uri)
+          [InR $ mkCodeAction "ENRICO - Make all imports explicit" (Just $ A.toJSON $ ExplicitAll _uri)
           -- We should only provide this code action if there are any code
           -- of this type
           | any (\x -> iaResType x == ExplicitImport) relevantCodeActions]
@@ -261,7 +123,7 @@ codeActionProvider _ ideState _pId (CodeActionParams _ _ TextDocumentIdentifier 
         -- the title. The actual resolve data type, ResolveOne is used by both
         -- of them
         toCodeAction uri (ImportAction _ int ExplicitImport) =
-          mkCodeAction "Make this import explicit foobar" (Just $ A.toJSON $ ResolveOne uri int)
+          mkCodeAction "ENRICO - Make this import explicit" (Just $ A.toJSON $ ResolveOne uri int)
         toCodeAction uri (ImportAction _  int RefineImport) =
           mkCodeAction "Refine this import" (Just $ A.toJSON $ ResolveOne uri int)
     pure $ InL ((InR . toCodeAction _uri <$> relevantCodeActions) <> allExplicit <> allRefine)
@@ -366,8 +228,8 @@ exportedModuleStrings ParsedModule{pm_parsed_source = L _ HsModule{..}}
     = map (T.unpack . printOutputable) exports
 exportedModuleStrings _ = []
 
-minimalImportsRule :: Recorder (WithPriority Log) -> (ModuleName -> Bool) -> Rules ()
-minimalImportsRule recorder modFilter = defineNoDiagnostics (cmapWithPrio LogShake recorder) $ \ImportActions nfp -> runMaybeT $ do
+minimalImportsRule :: Recorder (WithPriority Log) -> Rules ()
+minimalImportsRule recorder = defineNoDiagnostics (cmapWithPrio LogShake recorder) $ \ImportActions nfp -> runMaybeT $ do
   -- Get the typechecking artifacts from the module
   tmr <- MaybeT $ use TypeCheck nfp
   -- We also need a GHC session with all the dependencies
@@ -392,8 +254,6 @@ minimalImportsRule recorder modFilter = defineNoDiagnostics (cmapWithPrio LogSha
           | (location, impDecl, minImport) <- locationImportWithMinimal
           , not (isQualifiedImport impDecl)
           , not (isExplicitImport impDecl)
-          , let L _ moduleName = ideclName impDecl
-          , modFilter moduleName
           , let range = realSrcSpanToRange location]
 
       refineImportsResult =
@@ -474,50 +334,6 @@ extractMinimalImports hsc TcModuleResult {..} = runMaybeT $ do
 isExplicitImport :: ImportDecl GhcRn -> Bool
 isExplicitImport ImportDecl {ideclImportList = Just (Exactly, _)} = True
 isExplicitImport _                                                = False
-
--- This number is somewhat arbitrarily chosen. Ideally the protocol would tell us these things,
--- but at the moment I don't believe we know it.
--- 80 columns is traditional, but Haskellers tend to use longer lines (citation needed) and it's
--- probably not too bad if the lens is a *bit* longer than normal lines.
-maxColumns :: Int
-maxColumns = 120
-
--- we don't want to create a really massive code lens (and the decl can be extremely large!).
--- So we abbreviate it to fit a max column size, and indicate how many more items are in the list
--- after the abbreviation
-abbreviateImportTitle :: T.Text -> T.Text
-abbreviateImportTitle input =
-  let
-      -- For starters, we only want one line in the title
-      -- we also need to compress multiple spaces into one
-      oneLineText = T.unwords $ filter (not . T.null) $ T.split isSpace input
-      -- Now, split at the max columns, leaving space for the summary text we're going to add
-      -- (conservatively assuming we won't need to print a number larger than 100)
-      (prefix, suffix) = T.splitAt (maxColumns - T.length (summaryText 100)) oneLineText
-      -- We also want to truncate the last item so we get a "clean" break, rather than half way through
-      -- something. The conditional here is just because 'breakOnEnd' doesn't give us quite the right thing
-      -- if there are actually no commas.
-      (actualPrefix, extraSuffix) = if T.count "," prefix > 0 then T.breakOnEnd "," prefix else (prefix, "")
-      actualSuffix = extraSuffix <> suffix
-
-      -- The number of additional items is the number of commas+1
-      numAdditionalItems = T.count "," actualSuffix + 1
-      -- We want to make text like this: import Foo (AImport, BImport, ... (30 items))
-      -- We also want it to look sensible if we end up splitting in the module name itself,
-      summaryText :: Int -> T.Text
-      summaryText n = " ... (" <> fromString (show n) <> " items)"
-      -- so we only add a trailing paren if we've split in the export list
-      suffixText = summaryText numAdditionalItems <> if T.count "(" prefix > 0 then ")" else ""
-      title =
-          -- If the original text fits, just use it
-          if T.length oneLineText <= maxColumns
-          then oneLineText
-          else actualPrefix <> suffixText
-  in title
-
--- Create an import abbreviate title without module for inlay hints
-abbreviateImportTitleWithoutModule :: Text.Text -> Text.Text
-abbreviateImportTitleWithoutModule = abbreviateImportTitle . T.dropWhile (/= '(')
 
 -- | The title of the command is ideally the minimal explicit import decl, but
 --------------------------------------------------------------------------------
