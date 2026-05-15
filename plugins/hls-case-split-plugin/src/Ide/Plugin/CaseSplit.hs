@@ -64,7 +64,8 @@ suggestCaseSplitProvider
                 in pure $ InL [InR (CodeAction "Add placeholders for all missing patterns" (Just CodeActionKind_QuickFix) Nothing Nothing Nothing (Just $ edit msg) Nothing Nothing)]
         where
           pragmaInsertRange = let p = _end _range in Range p p
-          textEdits msg = let extract = T.unlines
+          textEdits msg = let extract = T.init
+                                      . T.unlines
                                       . reverse
                                       . map (("    " `T.append`) . (`T.append` " -> _"))
                                       . take 2
