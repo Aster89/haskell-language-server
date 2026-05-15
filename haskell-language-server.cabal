@@ -559,6 +559,26 @@ library hls-explicit-imports-plugin
   default-extensions:
     DataKinds
 
+test-suite hls-explicit-imports-plugin-tests
+  import:           defaults, pedantic, test-defaults, warnings
+  if !flag(importlens)
+    buildable: False
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   plugins/hls-explicit-imports-plugin/test
+  main-is:          Main.hs
+  build-depends:
+    , extra
+    , filepath
+    , haskell-language-server:hls-explicit-imports-plugin
+    , hls-test-utils   == 2.14.0.0
+    , lens
+    , lsp-types
+    , text
+
+-----------------------------
+-- case split plugin
+-----------------------------
+
 flag caseSplit
   description: Enable caseSplit plugin
   default:     True
@@ -582,9 +602,9 @@ library hls-case-split-plugin
     , extra
     , ghc
     , ghc-exactprint
-    , ghcide                == 2.13.0.0
+    , ghcide                == 2.14.0.0
     , hls-graph
-    , hls-plugin-api        == 2.13.0.0
+    , hls-plugin-api        == 2.14.0.0
     , lens
     , lsp
     , mtl
@@ -594,17 +614,17 @@ library hls-case-split-plugin
   default-extensions:
     DataKinds
 
-test-suite hls-explicit-imports-plugin-tests
+test-suite hls-case-split-plugin-tests
   import:           defaults, pedantic, test-defaults, warnings
-  if !flag(importlens)
+  if !flag(casesplit)
     buildable: False
   type:             exitcode-stdio-1.0
-  hs-source-dirs:   plugins/hls-explicit-imports-plugin/test
+  hs-source-dirs:   plugins/hls-case-split-plugin/test
   main-is:          Main.hs
   build-depends:
     , extra
     , filepath
-    , haskell-language-server:hls-explicit-imports-plugin
+    , haskell-language-server:hls-case-split-plugin
     , hls-test-utils   == 2.14.0.0
     , lens
     , lsp-types
