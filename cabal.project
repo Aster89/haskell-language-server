@@ -87,3 +87,5 @@ if impl(ghc >= 9.14)
     time-compat:time,
     uuid-types:template-haskell,
     websockets:containers,
+
+with-compiler: ghc-9.14.1
