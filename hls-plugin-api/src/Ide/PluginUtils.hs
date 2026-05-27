@@ -170,7 +170,7 @@ diffTextEdit fText f2Text withDeletions = r
         ec = fromIntegral $ length $ last $ lrContents fm
         e = Position (fromIntegral $ el - 1) ec -- Note: zero-based lines
 
--- | A pure version of 'diffText' for testing
+-- | A pure version of 'diffText' for testing. TODO: add tests
 diffText' :: Bool -> (VersionedTextDocumentIdentifier, T.Text) -> T.Text -> WithDeletions -> WorkspaceEdit
 diffText' supports (verTxtDocId, fText) f2Text withDeletions =
   if supports

@@ -601,6 +601,7 @@ library hls-case-split-plugin
     , deepseq
     , extra
     , ghc
+    , haskell-language-server:hls-refactor-plugin
     , ghc-exactprint
     , ghcide                == 2.14.0.0
     , hls-graph
