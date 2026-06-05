@@ -30,9 +30,9 @@ import GHC.Driver.Env.Types
 import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
 import Development.IDE.GHC.Compat.Parser (ParsedModule)
 import Development.IDE.GHC.Compat.Core (DynFlags)
-import GHC (ParsedModule(pm_parsed_source), MatchGroup (..), Match (m_pats, m_grhss), GRHSs (grhssGRHSs))
+import GHC (ParsedModule(pm_parsed_source, pm_mod_summary), MatchGroup (..), Match (m_pats, m_grhss), GRHSs (grhssGRHSs), ModSummary)
 import Language.Haskell.GHC.ExactPrint.Transform (HasDecls(hsDecls))
-import Development.IDE.GHC.Compat (HasSrcSpan(getLoc))
+import Development.IDE.GHC.Compat (HasSrcSpan(getLoc), Messages, GhcMessage, TcGblEnv)
 import Development.IDE.GHC.Compat.Core (SrcSpan)
 import Ide.PluginUtils (subRange)
 import GHC.Types.SrcLoc (GenLocated(L))
@@ -44,6 +44,12 @@ import Development.IDE.GHC.Compat.ExactPrint
 import GHC.IsList (toList)
 import Development.IDE.Core.Shake (getDiagnostics)
 import Control.Concurrent.STM.Stats (atomically)
+import qualified Data.Foldable as Foldable
+import GHC.Utils.Error (MsgEnvelope)
+import qualified Development.IDE.Types.Diagnostics as LSP
+import Development.IDE.Core.Compile
+import Development.IDE.Core.Rules (getParsedModuleDefinition)
+import Development.IDE.Types.Options (IdeOptions)
 
 -- TODO: remove this duplication
 -- | Check if some `HasSrcSpan` value is in the given range
@@ -78,85 +84,56 @@ data Pragma = LangExt T.Text | OptGHC T.Text
 
 suggestCaseSplitProvider :: PluginMethodHandler IdeState 'LSP.Method_TextDocumentCodeAction
 suggestCaseSplitProvider
-  state
+  _
   _
   CodeActionParams{ _textDocument = docId@TextDocumentIdentifier{..}
                   , _context = CodeActionContext{_diagnostics = [Diagnostic{..}]}
                   }
   = do
   nfp <- getNormalizedFilePathE _uri
-  pm <- runActionE "classplugin.addMethodPlaceholders.GetParsedModule" state
-      $ useE GetParsedModule nfp
-  let ps =
-#if !MIN_VERSION_ghc(9,10,0) || MIN_VERSION_ghc(9,11,0)
-            makeDeltaAst $
-#endif
-                pm_parsed_source pm
-#if MIN_VERSION_ghc_exactprint(1,10,0)
-  let allDecls = hsDecls ps
-#else
-  allDecls <- hsDecls ps
-#endif
-  _ <-  liftIO $ atomically $ getDiagnostics state -- XXX: this too contains
-                                                   -- NoStructuredMessage
-  verTxtDocId <-
-  -- TODO: I think I need some sort of folding, so I can search through
-  -- a list for something like this
-  --
-  --            - `CaseAlt`: this exists only if there's a non-zero list of
-  --            alternatives, which means we can just pick the indentation of
-  --            one of those and call it a day
-  --
-  --            - `HsCase`: this exists irrespective of how many alternatives
-  --            are already written
-    trace (unlines ["_range = " ++ show _range,
-                    case break (inRange _range . getLoc) allDecls of
-      (before, L l foo : after) -> unlines ["(length before, length after) = "
-                                                ++ show (length before, length after),
-                                            case foo of
-          TyClD _ _ -> "TyClD"
-          InstD _ _ -> "InstD"
-          DerivD _ _ -> "DerivD"
-          ValD _ bind -> unlines ["ValD = " ++ case bind of
-            PatBind{} -> "PatBind"
-            PatSynBind{} -> "PatSynBind"
-            VarBind{} -> "VarBind"
-            FunBind{..} -> unlines ["FunBind = " ++
-                                    case mg_alts fun_matches of
-                              L _ [L _ m] -> case toList (grhssGRHSs (m_grhss m)) of
-                                  l -> showAst l
-                              _ -> "l is longer than 1"
-                                   , ("#matches = " ++)
-                                        $ show $ length
-                                        $ foldr (:) [] (mg_alts fun_matches)]
-            -- TODO: pull out the existing declarations
-            ]
-          SigD _ _ -> "SigD"
-          KindSigD _ _ -> "KindSigD"
-          DefD _ _ -> "DefD"
-          ForD _ _ -> "ForD"
-          WarningD _ _ -> "WarningD"
-          AnnD _ _ -> "AnnD"
-          RuleD _ _ -> "RuleD"
-          SpliceD _ _ -> "SpliceD"
-          DocD _ _ -> "DocD"
-          RoleAnnotD _ _ -> "RoleAnnotD"
-          ]
-      _ -> "No elem in range"
-        ]) liftIO $ runAction "classplugin.codeAction.getVersionedTextDoc"{- TODO change this -} state $ getVersionedTextDoc docId
-  normalizedFilePath <- getNormalizedFilePathE (verTxtDocId ^. L.uri)
-  -- TODO: retrieve the structured error message
-  activeDiagnosticsInRange (shakeExtras state) normalizedFilePath _range >>= \case
-    Just [d] -> let Diagnostic{ _message = msg } = fdLspDiagnostic d
-                    strMsg = fdStructuredMessage d -- XXX Unfortunately this is a NoStructuredMessage :(
-                in -- trace (">> " ++ show strMsg) $
-                  pure $ InL [InR (CodeAction "Add placeholders for all missing patterns" (Just CodeActionKind_QuickFix) Nothing Nothing Nothing (Just $ edit msg) Nothing Nothing)]
+  let ms = _ :: ModSummary
+  let opt = _ :: IdeOptions
+  let hsc = _ :: HscEnv
+  let tcg = _ :: TcGblEnv
+
+  (diags, mb_pm) <- liftIO $ getParsedModuleDefinition hsc opt nfp ms
+
+  fromCompilation :: Messages GhcMessage <-case mb_pm of
+      Nothing -> undefined
+      Just pm -> do fmap (_ {- this is easy if I change compileModule's signature -})
+                  $ liftIO
+                  $ compileModule (RunSimplifier True) hsc (pm_mod_summary pm) tcg
+
+  let msgs = Foldable.toList fromCompilation
+  let msgEnv :: MsgEnvelope GhcMessage = _ $ head msgs
+  let d :: FileDiagnostic = ideErrorFromLspDiag (LSP.Diagnostic {
+                                      _range = noRange,
+                                      _severity = Nothing,
+                                      _code = Nothing,
+                                      _source = Nothing,
+                                      _message = "",
+                                      _relatedInformation = Nothing,
+                                      _tags = Nothing,
+                                      _codeDescription = Nothing,
+                                      _data_ = Nothing
+                                    })
+                              nfp
+                              (Just msgEnv)
+
+  let Diagnostic{ _message = msg } = fdLspDiagnostic d
+  pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
+                              (Just CodeActionKind_QuickFix)
+                              Nothing
+                              Nothing
+                              Nothing
+                              (Just $ edit msg)
+                              Nothing Nothing)]
         where
           pragmaInsertRange = let p = _end _range in Range p p
           textEdits msg = let extract = T.init
                                       . T.unlines
                                       . reverse
-                                      . map (("    " `T.append`) . (`T.append` " -> _"))
+                                      . map (("    " `T.append`) . (`T.append` " -> undefined"))
                                       . take 2
                                       . reverse
                                       . T.lines
@@ -166,5 +143,4 @@ suggestCaseSplitProvider
               (Just $ M.singleton _uri (textEdits msg))
               Nothing
               Nothing
-    _ -> undefined
 suggestCaseSplitProvider _ _ _ = pure $ InL $ []
