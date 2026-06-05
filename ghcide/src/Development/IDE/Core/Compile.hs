@@ -150,7 +150,7 @@ import           GHC.Types.HpcInfo                            (emptyHpcInfo)
 #if MIN_VERSION_ghc(9,11,0)
 import qualified Data.List.NonEmpty                           as NE
 import           Data.Time                                    (getCurrentTime)
-import           GHC.Driver.Env                               (hsc_all_home_unit_ids)
+import           GHC.Driver.Env                               (hsc_all_home_unit_ids, runHsc')
 import           GHC.Iface.Ext.Types                          (NameEntityInfo)
 #endif
 
@@ -164,6 +164,18 @@ import           GHC.Types.Avail                              (emptyDetOrdAvails
 
 #if MIN_VERSION_ghc(9,12,0)
 import           Development.IDE.Import.FindImports
+import GHC.Driver.Main (hscDesugar', hscSimplify', getHscEnv)
+import GHC.Driver.Config.Diagnostic (initPrintConfig)
+import GHC.Driver.Errors (printOrThrowDiagnostics)
+import GHC.Driver.DynFlags (DynFlags(maxUncoveredPatterns), DumpFlag (Opt_D_dump_rn_ast))
+import GHC.Utils.Logger (HasLogger(getLogger), putDumpFileMaybe, DumpFormat (FormatHaskell))
+import GHC.Hs.Dump (BlankEpAnnotations(NoBlankEpAnnotations), BlankSrcSpan (NoBlankSrcSpan), showAstData)
+import GHC.Plugins (SDocContext(..), IsLine (ftext), defaultDumpStyle)
+import GHC.Utils.Ppr.Colour (defaultScheme, colReset)
+import GHC.Plugins (DynFlags(..))
+import GHC.Data.Bool (overrideWith)
+import GHC.Plugins (DumpFlag(..))
+import GHC.Plugins (dopt)
 #endif
 
 --Simple constants to make sure the source is consistently named
