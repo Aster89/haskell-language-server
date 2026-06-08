@@ -32,7 +32,7 @@ import Development.IDE.GHC.Compat.Parser (ParsedModule)
 import Development.IDE.GHC.Compat.Core (DynFlags)
 import GHC (ParsedModule(pm_parsed_source, pm_mod_summary), MatchGroup (..), Match (m_pats, m_grhss), GRHSs (grhssGRHSs), ModSummary)
 import Language.Haskell.GHC.ExactPrint.Transform (HasDecls(hsDecls))
-import Development.IDE.GHC.Compat (HasSrcSpan(getLoc), Messages, GhcMessage, TcGblEnv)
+import Development.IDE.GHC.Compat (HasSrcSpan(getLoc), Messages (getMessages), GhcMessage, TcGblEnv)
 import Development.IDE.GHC.Compat.Core (SrcSpan)
 import Ide.PluginUtils (subRange)
 import GHC.Types.SrcLoc (GenLocated(L))
@@ -42,7 +42,7 @@ import Language.Haskell.GHC.ExactPrint.Utils
 import GHC.Driver.Ppr
 import Development.IDE.GHC.Compat.ExactPrint
 import GHC.IsList (toList)
-import Development.IDE.Core.Shake (getDiagnostics)
+import Development.IDE.Core.Shake (getDiagnostics, getIdeOptions, getIdeOptionsIO)
 import Control.Concurrent.STM.Stats (atomically)
 import qualified Data.Foldable as Foldable
 import GHC.Utils.Error (MsgEnvelope)
@@ -50,6 +50,9 @@ import qualified Development.IDE.Types.Diagnostics as LSP
 import Development.IDE.Core.Compile
 import Development.IDE.Core.Rules (getParsedModuleDefinition)
 import Development.IDE.Types.Options (IdeOptions)
+import Control.Monad.RWS
+import Data.Maybe
+import GHC.Data.Bag
 
 -- TODO: remove this duplication
 -- | Check if some `HasSrcSpan` value is in the given range
@@ -84,28 +87,34 @@ data Pragma = LangExt T.Text | OptGHC T.Text
 
 suggestCaseSplitProvider :: PluginMethodHandler IdeState 'LSP.Method_TextDocumentCodeAction
 suggestCaseSplitProvider
-  _
+  state
   _
   CodeActionParams{ _textDocument = docId@TextDocumentIdentifier{..}
                   , _context = CodeActionContext{_diagnostics = [Diagnostic{..}]}
                   }
   = do
   nfp <- getNormalizedFilePathE _uri
-  let ms = _ :: ModSummary
-  let opt = _ :: IdeOptions
-  let hsc = _ :: HscEnv
-  let tcg = _ :: TcGblEnv
+  ms :: ModSummary <- fmap msrModSummary
+                    $ runActionE "what to put here 1?" state
+                    $ useE GetModSummaryWithoutTimestamps nfp
+  opt :: IdeOptions <- runActionE "GhcideCodeActions.getIdeOptions" state (lift getIdeOptions)
+  hsc :: HscEnv <- fmap hscEnv
+                 $ runActionE "what to put here 2?" state
+                 $ useE GhcSession nfp
+  tcmr :: TcModuleResult <- runActionE "what to put here 3?" state
+                          $ useE TypeCheck nfp
+  let tcg :: TcGblEnv = tmrTypechecked tcmr
 
   (diags, mb_pm) <- liftIO $ getParsedModuleDefinition hsc opt nfp ms
 
+
   fromCompilation :: Messages GhcMessage <-case mb_pm of
-      Nothing -> undefined
-      Just pm -> do fmap (_ {- this is easy if I change compileModule's signature -})
-                  $ liftIO
+      Nothing -> error "oooops"
+      Just pm -> do liftIO
+                  $ fmap snd $ fmap (fmap (snd . fromJust))
                   $ compileModule (RunSimplifier True) hsc (pm_mod_summary pm) tcg
 
-  let msgs = Foldable.toList fromCompilation
-  let msgEnv :: MsgEnvelope GhcMessage = _ $ head msgs
+  let msgEnv :: MsgEnvelope GhcMessage = fromJust $ headMaybe $ getMessages fromCompilation
   let d :: FileDiagnostic = ideErrorFromLspDiag (LSP.Diagnostic {
                                       _range = noRange,
                                       _severity = Nothing,

@@ -678,7 +678,7 @@ compileModule
     -> HscEnv
     -> ModSummary
     -> TcGblEnv
-    -> IO (IdeResult ModGuts)
+    -> IO (IdeResult (ModGuts, Messages GhcMessage))
 compileModule (RunSimplifier simplify) session ms tcg =
   catchSrcErrors (hsc_dflags session) compilePhase compileAction
        >>= \case Left diags             -> pure (diags, Nothing)

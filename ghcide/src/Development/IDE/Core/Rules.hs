@@ -964,7 +964,7 @@ generateCore runSimplifier file = do
     packageState <- hscEnv <$> use_ GhcSessionDeps file
     hsc' <- setFileCacheHook packageState
     tm <- use_ TypeCheck file
-    liftIO $ compileModule runSimplifier hsc' (tmrModSummary tm) (tmrTypechecked tm)
+    liftIO $ fmap (fmap (fmap fst)) $ compileModule runSimplifier hsc' (tmrModSummary tm) (tmrTypechecked tm)
 
 generateCoreRule :: Recorder (WithPriority Log) -> Rules ()
 generateCoreRule recorder =
@@ -1040,7 +1040,7 @@ regenerateHiFile sess f ms compNeeded = do
               Nothing -> pure (diags', Nothing)
               Just tmr -> do
 
-                let compile = liftIO $ compileModule (RunSimplifier True) hsc (pm_mod_summary pm) $ tmrTypechecked tmr
+                let compile = liftIO $ fmap (fmap (fmap fst)) $ compileModule (RunSimplifier True) hsc (pm_mod_summary pm) $ tmrTypechecked tmr
 
                 se <- getShakeExtras
 
