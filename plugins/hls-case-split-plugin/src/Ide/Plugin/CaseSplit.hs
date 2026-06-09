@@ -53,9 +53,10 @@ import Development.IDE.Types.Options (IdeOptions)
 import Control.Monad.RWS
 import Data.Maybe
 import GHC.Data.Bag
+import qualified GHC.Data.Bag  as B (bagToList)
 
 -- TODO: remove this duplication
--- | Check if some `HasSrcSpan` value is in the given range
+-- | Check if some `HasSrcSpan` value isin the given range
 inRange :: Range -> SrcSpan -> Bool
 inRange range s = maybe False (subRange range) (srcSpanToRange s)
 
@@ -89,67 +90,83 @@ suggestCaseSplitProvider :: PluginMethodHandler IdeState 'LSP.Method_TextDocumen
 suggestCaseSplitProvider
   state
   _
-  CodeActionParams{ _textDocument = docId@TextDocumentIdentifier{..}
+  CodeActionParams{ _textDocument = TextDocumentIdentifier{..}
                   , _context = CodeActionContext{_diagnostics = [Diagnostic{..}]}
                   }
   = do
   nfp <- getNormalizedFilePathE _uri
+
   ms :: ModSummary <- fmap msrModSummary
-                    $ runActionE "what to put here 1?" state
+                    $ runActionE "random string 1" state
                     $ useE GetModSummaryWithoutTimestamps nfp
-  opt :: IdeOptions <- runActionE "GhcideCodeActions.getIdeOptions" state (lift getIdeOptions)
+
+  opt :: IdeOptions <- runActionE "random string 2" state (lift getIdeOptions)
+
   hsc :: HscEnv <- fmap hscEnv
-                 $ runActionE "what to put here 2?" state
+                 $ runActionE "random string 3" state
                  $ useE GhcSession nfp
-  tcmr :: TcModuleResult <- runActionE "what to put here 3?" state
+
+  tcmr :: TcModuleResult <- runActionE "random string 4" state
                           $ useE TypeCheck nfp
+
   let tcg :: TcGblEnv = tmrTypechecked tcmr
 
   (diags, mb_pm) <- liftIO $ getParsedModuleDefinition hsc opt nfp ms
 
-
-  fromCompilation :: Messages GhcMessage <-case mb_pm of
-      Nothing -> error "oooops"
+  fromCompilation :: Messages GhcMessage <- case mb_pm of
       Just pm -> do liftIO
-                  $ fmap snd $ fmap (fmap (snd . fromJust))
+                  $ fmap (snd . fmap (snd . fromJust))
                   $ compileModule (RunSimplifier True) hsc (pm_mod_summary pm) tcg
+      Nothing -> error "oooops"
 
-  let msgEnv :: MsgEnvelope GhcMessage = fromJust $ headMaybe $ getMessages fromCompilation
-  let d :: FileDiagnostic = ideErrorFromLspDiag (LSP.Diagnostic {
-                                      _range = noRange,
-                                      _severity = Nothing,
-                                      _code = Nothing,
-                                      _source = Nothing,
-                                      _message = "",
-                                      _relatedInformation = Nothing,
-                                      _tags = Nothing,
-                                      _codeDescription = Nothing,
-                                      _data_ = Nothing
-                                    })
-                              nfp
-                              (Just msgEnv)
+  let msgs = B.bagToList $ getMessages fromCompilation
 
-  let Diagnostic{ _message = msg } = fdLspDiagnostic d
-  pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
-                              (Just CodeActionKind_QuickFix)
-                              Nothing
-                              Nothing
-                              Nothing
-                              (Just $ edit msg)
-                              Nothing Nothing)]
-        where
-          pragmaInsertRange = let p = _end _range in Range p p
-          textEdits msg = let extract = T.init
-                                      . T.unlines
-                                      . reverse
-                                      . map (("    " `T.append`) . (`T.append` " -> undefined"))
-                                      . take 2
-                                      . reverse
-                                      . T.lines
-                          in [TextEdit pragmaInsertRange $ ("\n" `T.append`) (extract  msg)]
-          edit msg =
-            WorkspaceEdit
-              (Just $ M.singleton _uri (textEdits msg))
-              Nothing
-              Nothing
+  liftIO $ putStrLn $ (">> " ++) $ show $ length msgs
+
+  case listToMaybe $ msgs of
+    Nothing -> do liftIO $ putStrLn ">> No messages"
+                  pure $ InL $ []
+    Just m -> do
+      let msgEnv :: MsgEnvelope GhcMessage = m
+      let d :: FileDiagnostic = ideErrorFromLspDiag (LSP.Diagnostic {
+                                          _range = noRange,
+                                          _severity = Nothing,
+                                          _code = Nothing,
+                                          _source = Nothing,
+                                          _message = "",
+                                          _relatedInformation = Nothing,
+                                          _tags = Nothing,
+                                          _codeDescription = Nothing,
+                                          _data_ = Nothing
+                                        })
+                                  nfp
+                                  (Just msgEnv)
+
+      let Diagnostic{ _message = msg } = fdLspDiagnostic d
+      liftIO $ putStrLn $ (">> " ++) $ T.unpack msg
+      liftIO $ putStrLn $ (">> " ++) $ show $ fdStructuredMessage d
+      let r = InL [InR (CodeAction "Add placeholders for all missing patterns"
+                                  (Just CodeActionKind_QuickFix)
+                                  Nothing
+                                  Nothing
+                                  Nothing
+                                  (Just $ edit msg)
+                                  Nothing
+                                  Nothing)]
+      return r
+                  where
+                    pragmaInsertRange = let p = _end _range in Range p p
+                    textEdits msg = let extract = T.init
+                                                . T.unlines
+                                                . reverse
+                                                . map (("    " `T.append`) . (`T.append` " -> undefined"))
+                                                . take 2
+                                                . reverse
+                                                . T.lines
+                                    in [TextEdit pragmaInsertRange $ ("\n" `T.append`) (extract  msg)]
+                    edit msg =
+                      WorkspaceEdit
+                        (Just $ M.singleton _uri (textEdits msg))
+                        Nothing
+                        Nothing
 suggestCaseSplitProvider _ _ _ = pure $ InL $ []
