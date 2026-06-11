@@ -12,49 +12,20 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
-import           Control.Lens                             hiding (List)
-import           Control.Monad.IO.Class                   (MonadIO (liftIO))
 import qualified Data.Map                                 as M
 import qualified Data.Text                                as T
 import           Development.IDE                          hiding (line)
-import           Development.IDE.Core.FileStore           (getVersionedTextDoc)
 import           Development.IDE.Core.PluginUtils
 import           Ide.Plugin.Error
 import           Ide.Types
-import qualified Language.LSP.Protocol.Lens               as L
 import qualified Language.LSP.Protocol.Message            as LSP
-import Debug.Trace (trace)
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import GHC.Driver.Env.Types
-import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
-import Development.IDE.GHC.Compat.Parser (ParsedModule)
-import Development.IDE.GHC.Compat.Core (DynFlags)
-import GHC (ParsedModule(pm_parsed_source, pm_mod_summary), MatchGroup (..), Match (m_pats, m_grhss), GRHSs (grhssGRHSs), ModSummary, srcSpanStartLine, srcSpanEndLine, srcSpanStartCol, srcSpanEndCol)
-import Language.Haskell.GHC.ExactPrint.Transform (HasDecls(hsDecls))
-import Development.IDE.GHC.Compat (HasSrcSpan(getLoc), Messages (getMessages), GhcMessage, TcGblEnv)
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage))
 import Development.IDE.GHC.Compat.Core (SrcSpan)
 import Ide.PluginUtils (subRange)
-import GHC.Types.SrcLoc (GenLocated(L), srcSpanToRealSrcSpan)
-import GHC.Hs.Decls (HsDecl(..))
-import Language.Haskell.Syntax.Binds (HsBindLR(..))
-import Language.Haskell.GHC.ExactPrint.Utils
-import GHC.Driver.Ppr
-import Development.IDE.GHC.Compat.ExactPrint
-import GHC.IsList (toList)
-import Development.IDE.Core.Shake (getDiagnostics, getIdeOptions, getIdeOptionsIO)
-import Control.Concurrent.STM.Stats (atomically)
-import qualified Data.Foldable as Foldable
-import GHC.Utils.Error (MsgEnvelope (errMsgSpan, errMsgSeverity))
-import qualified Development.IDE.Types.Diagnostics as LSP
-import Development.IDE.Core.Compile
-import Development.IDE.Core.Rules (getParsedModuleDefinition)
-import Development.IDE.Types.Options (IdeOptions)
 import Control.Monad.RWS
-import Data.Maybe
-import GHC.Data.Bag
-import qualified GHC.Data.Bag  as B
-import GHC.Utils.Json
+import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns))
 
 -- TODO: remove this duplication
 -- | Check if some `HasSrcSpan` value isin the given range
@@ -92,88 +63,31 @@ suggestCaseSplitProvider
   state
   _
   CodeActionParams{ _textDocument = TextDocumentIdentifier{..}
-                  , _context = CodeActionContext{_diagnostics = [Diagnostic{..}]}
+                  , _range = range
                   }
   = do
   nfp <- getNormalizedFilePathE _uri
 
-  ms :: ModSummary <- fmap msrModSummary
-                    $ runActionE "random string 1" state
-                    $ useE GetModSummary nfp
+  diags :: [FileDiagnostic] <- activeDiagnosticsInRange (shakeExtras state) nfp range
+    >>= \case
+    Nothing -> do liftIO $ putStrLn "Nothing here..."
+                  return []
+    Just fileDiags -> do liftIO $ putStrLn "Something here!"
+                         return fileDiags
 
-  opt :: IdeOptions <- runActionE "random string 2" state (lift getIdeOptions)
+  edit <- case (_magic diags) :: GhcMessage of
+     (GhcDsMessage m) -> case m of
+       d@DsNonExhaustivePatterns{} -> return (_generateTextEdit d)
+       _ -> error "I'll think about it 1"
+     _ -> error "I'll think about it 2"
 
-  hsc :: HscEnv <- fmap hscEnv
-                 $ runActionE "random string 3" state
-                 $ useE GhcSession nfp
+  pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
+                              (Just CodeActionKind_QuickFix)
+                              Nothing
+                              Nothing
+                              Nothing
+                              (Just edit)
+                              Nothing
+                              Nothing)]
 
-  tcmr :: TcModuleResult <- runActionE "random string 4" state
-                          $ useE TypeCheck nfp
-
-  let ws = tmrWarnings tcmr
-
-  liftIO $ putStrLn $ ("warnings? " ++) $ show $ length ws -- prints 0
-
-  let tcg :: TcGblEnv = tmrTypechecked tcmr
-
-  (diags, mb_pm) <- liftIO $ getParsedModuleDefinition hsc opt nfp ms
-  liftIO $ putStrLn $ ("Diagnostics from parsing: " ++) $ show diags -- prints []
-
-  fromCompilation :: Messages GhcMessage <- case mb_pm of
-      Just pm -> do liftIO
-                  $ fmap (snd . fmap (snd . fromJust))
-                  $ compileModule (RunSimplifier False) hsc (pm_mod_summary pm) tcg
-      Nothing -> error "oooops"
-
-  liftIO $ putStrLn $ ("how many messages? " ++) $ show $ length $ getMessages fromCompilation -- prints 1
-
-  case headMaybe $ getMessages fromCompilation of
-    Nothing -> do liftIO $ putStrLn "No messages!"
-                  pure $ InL $ []
-    Just m -> do
-      let s = showSDocUnsafe $ renderJSON $ json m
-      liftIO $ putStrLn $ ("stringified message: " ++) s -- does not contain the structured error message
-      let span = srcSpanToRealSrcSpan $ errMsgSpan m
-      let sev = errMsgSeverity m
-
-      -- TODO: why am I creating a whole Diagnostic at all?
-      -- Instead, I should simply obtain the `_message :: Text`
-      -- part of it, and pass it to the `CodeAction`.
-      let Diagnostic{ _message = msg } = LSP.Diagnostic {
-                      _range = Range { _start = Position { _line = fromIntegral $ fromJust $ srcSpanStartLine <$> span
-                                                         , _character = fromIntegral $ fromJust $ srcSpanEndLine <$> span }
-                                     , _end = Position { _line = fromIntegral $ fromJust $ srcSpanStartCol <$> span
-                                                       , _character = fromIntegral $ fromJust $ srcSpanEndCol <$> span } }
-                    , _severity = Just $ DiagnosticSeverity_Hint
-                    , _code = Just $ InR "hello" -- What is this?
-                    , _source = Nothing
-                    , _message = T.unlines ["a", "b", "c", "d", "e", "f", "g"] -- <-- TODO: I only need this one, really
-                    , _relatedInformation = Nothing
-                    , _tags = Nothing
-                    , _codeDescription = Nothing
-                    , _data_ = Nothing
-                    }
-      pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
-                                  (Just CodeActionKind_QuickFix)
-                                  Nothing
-                                  Nothing
-                                  Nothing
-                                  (Just $ edit msg)
-                                  Nothing
-                                  Nothing)]
-                  where
-                    pragmaInsertRange = let p = _end _range in Range p p
-                    textEdits msg = let extract = T.init
-                                                . T.unlines
-                                                . reverse
-                                                . map (("    " `T.append`) . (`T.append` " -> undefined"))
-                                                . take 2
-                                                . reverse
-                                                . T.lines
-                                    in [TextEdit pragmaInsertRange $ ("\n" `T.append`) (extract  msg)]
-                    edit msg =
-                      WorkspaceEdit
-                        (Just $ M.singleton _uri (textEdits msg))
-                        Nothing
-                        Nothing
 suggestCaseSplitProvider _ _ _ = pure $ InL $ []
