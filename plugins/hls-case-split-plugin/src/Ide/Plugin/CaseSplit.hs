@@ -72,22 +72,36 @@ suggestCaseSplitProvider
     >>= \case
     Nothing -> do liftIO $ putStrLn "Nothing here..."
                   return []
-    Just fileDiags -> do liftIO $ putStrLn "Something here!"
+    Just fileDiags -> do liftIO $ do putStrLn "Something here!"
+                                     print fileDiags
                          return fileDiags
 
-  edit <- case (_magic diags) :: GhcMessage of
-     (GhcDsMessage m) -> case m of
-       d@DsNonExhaustivePatterns{} -> return (_generateTextEdit d)
-       _ -> error "I'll think about it 1"
-     _ -> error "I'll think about it 2"
+  -- edit <- case (_magic diags) :: GhcMessage of
+  --    (GhcDsMessage m) -> case m of
+  --      d@DsNonExhaustivePatterns{} -> return (_generateTextEdit d)
+  --      _ -> error "I'll think about it 1"
+  --    _ -> error "I'll think about it 2"
 
   pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
                               (Just CodeActionKind_QuickFix)
                               Nothing
                               Nothing
                               Nothing
-                              (Just edit)
+                              (Just $ edit "abcdefg")
                               Nothing
                               Nothing)]
-
-suggestCaseSplitProvider _ _ _ = pure $ InL $ []
+                  where
+                    pragmaInsertRange = let p = _end range in Range p p
+                    textEdits msg = let extract = T.init
+                                                . T.unlines
+                                                . reverse
+                                                . map (("    " `T.append`) . (`T.append` " -> undefined"))
+                                                . take 2
+                                                . reverse
+                                                . T.lines
+                                    in [TextEdit pragmaInsertRange $ ("\n" `T.append`) (extract  msg)]
+                    edit msg =
+                      WorkspaceEdit
+                        (Just $ M.singleton _uri (textEdits msg))
+                        Nothing
+                        Nothing
