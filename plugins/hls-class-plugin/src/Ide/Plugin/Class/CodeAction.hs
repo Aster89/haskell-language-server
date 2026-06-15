@@ -93,7 +93,7 @@ codeAction recorder state plId (CodeActionParams _ _ docId caRange _) = do
             pure $ InL actions
     where
         methodDiags fileDiags =
-            mapMaybe (\d -> (d,) <$> isClassMethodWarning (d ^. fdStructuredMessageL)) fileDiags
+            mapMaybe (\d -> (d,) <$> isClassMethodWarning (fdStructuredMessage d)) fileDiags
 
         mkActions
             :: NormalizedFilePath
