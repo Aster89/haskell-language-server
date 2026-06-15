@@ -25,7 +25,11 @@ import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage))
 import Development.IDE.GHC.Compat.Core (SrcSpan)
 import Ide.PluginUtils (subRange)
 import Control.Monad.RWS
-import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns))
+import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
+import Data.Maybe (mapMaybe)
+import Control.Lens (Fold, Prism', prism', (^?))
+import Control.Monad (forM_)
+import Debug.Trace (traceIO)
 
 -- TODO: remove this duplication
 -- | Check if some `HasSrcSpan` value isin the given range
@@ -70,17 +74,26 @@ suggestCaseSplitProvider
 
   diags :: [FileDiagnostic] <- activeDiagnosticsInRange (shakeExtras state) nfp range
     >>= \case
-    Nothing -> do liftIO $ putStrLn "Nothing here..."
+    Nothing -> do liftIO $ traceIO "Nothing here..."
                   return []
-    Just fileDiags -> do liftIO $ do putStrLn "Something here!"
+    Just fileDiags -> do liftIO $ do traceIO "Something here!"
                                      print fileDiags
                          return fileDiags
 
-  -- edit <- case (_magic diags) :: GhcMessage of
-  --    (GhcDsMessage m) -> case m of
-  --      d@DsNonExhaustivePatterns{} -> return (_generateTextEdit d)
-  --      _ -> error "I'll think about it 1"
-  --    _ -> error "I'll think about it 2"
+  let dsmsgs = mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage) diags
+
+  if null dsmsgs
+    then error "empty messages"
+    else liftIO
+       $ do traceIO "Some messages..."
+            traceIO "----------------"
+            forM_ dsmsgs $ \case
+              !m@(DsNonExhaustivePatterns !a !b !c !d !e) -> do
+                  traceIO "Hello"
+                  -- _generateTextEdit m
+                  print c
+              _ -> error "I'll think about it"
+            traceIO "================"
 
   pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
                               (Just CodeActionKind_QuickFix)
@@ -105,3 +118,11 @@ suggestCaseSplitProvider
                         (Just $ M.singleton _uri (textEdits msg))
                         Nothing
                         Nothing
+
+_DsMessage :: Fold GhcMessage DsMessage
+_DsMessage = _DsMessageWithCtx
+
+_DsMessageWithCtx :: Prism' GhcMessage DsMessage
+_DsMessageWithCtx = prism' GhcDsMessage (\case
+  GhcDsMessage x -> Just x
+  _ -> Nothing)
