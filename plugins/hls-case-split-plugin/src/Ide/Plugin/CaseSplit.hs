@@ -21,21 +21,13 @@ import           Ide.Types
 import qualified Language.LSP.Protocol.Message            as LSP
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage))
-import Development.IDE.GHC.Compat.Core (SrcSpan)
-import Ide.PluginUtils (subRange)
-import Control.Monad.RWS
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Data.Maybe (mapMaybe)
-import Control.Lens (Fold, Prism', prism', (^?))
-import Control.Monad (forM_)
-import Debug.Trace (traceIO)
-
--- TODO: remove this duplication
--- | Check if some `HasSrcSpan` value isin the given range
-inRange :: Range -> SrcSpan -> Bool
-inRange range s = maybe False (subRange range) (srcSpanToRange s)
-
+import Control.Lens (Fold, prism', (^?), (<&>), (&))
+import Debug.Trace (trace, traceShowId)
+import GHC.HsToCore.Pmc.Solver.Types
+import GHC.Types.Unique.SDFM
 
 -- ---------------------------------------------------------------------
 data Log
@@ -73,56 +65,48 @@ suggestCaseSplitProvider
   nfp <- getNormalizedFilePathE _uri
 
   diags :: [FileDiagnostic] <- activeDiagnosticsInRange (shakeExtras state) nfp range
-    >>= \case
-    Nothing -> do liftIO $ traceIO "Nothing here..."
-                  return []
-    Just fileDiags -> do liftIO $ do traceIO "Something here!"
-                                     print fileDiags
-                         return fileDiags
+                                <&> \case Nothing -> error "Oops, no diagnostics!"
+                                          Just fileDiags -> traceShowId fileDiags
 
-  let dsmsgs = mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage) diags
+  case mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage) diags of
+    [dsmsg] -> do
+      let strs = dsmsg &
+              \case DsNonExhaustivePatterns !CaseAlt _ _ ![ids] !nablas -> do
+                        trace (">> " ++ show (length nablas)) $ nablas <&>
+                          (\nabla -> let facts = ts_facts $ nabla_tm_st nabla
+                                         pmalt = case vi_pos <$> lookupUSDFM facts ids of
+                                           Just [x] -> x
+                                           _ -> error "Oops"
+                                     in unwords $ showPpr (paca_con pmalt):(const "_" <$> paca_ids pmalt))
+                    _ -> error "Oops, DsMessage of unexpected shape!"
 
-  if null dsmsgs
-    then error "empty messages"
-    else liftIO
-       $ do traceIO "Some messages..."
-            traceIO "----------------"
-            forM_ dsmsgs $ \case
-              !m@(DsNonExhaustivePatterns !a !b !c !d !e) -> do
-                  traceIO "Hello"
-                  -- _generateTextEdit m
-                  print c
-              _ -> error "I'll think about it"
-            traceIO "================"
+      pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
+                                  (Just CodeActionKind_QuickFix)
+                                  Nothing
+                                  Nothing
+                                  Nothing
+                                  (Just $ edit $ T.pack $ unlines strs)
+                                  Nothing
+                                  Nothing)]
+    _ -> error "Oops, unexpected number of messages!"
 
-  pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
-                              (Just CodeActionKind_QuickFix)
-                              Nothing
-                              Nothing
-                              Nothing
-                              (Just $ edit "abcdefg")
-                              Nothing
-                              Nothing)]
-                  where
-                    pragmaInsertRange = let p = _end range in Range p p
-                    textEdits msg = let extract = T.init
-                                                . T.unlines
-                                                . reverse
-                                                . map (("    " `T.append`) . (`T.append` " -> undefined"))
-                                                . take 2
-                                                . reverse
-                                                . T.lines
-                                    in [TextEdit pragmaInsertRange $ ("\n" `T.append`) (extract  msg)]
-                    edit msg =
-                      WorkspaceEdit
-                        (Just $ M.singleton _uri (textEdits msg))
-                        Nothing
-                        Nothing
+  where
+    pragmaInsertRange = let p = _end range in Range p p
+    textEdit msg = let extract = T.init
+                               . T.unlines
+                               . map (("            " `T.append`) . (`T.append` " -> _"))
+                               . T.lines
+                   in TextEdit pragmaInsertRange $ "\n" `T.append` extract msg
+    edit msg =
+      WorkspaceEdit
+        (Just $ M.singleton _uri $ [textEdit msg])
+        Nothing
+        Nothing
 
 _DsMessage :: Fold GhcMessage DsMessage
-_DsMessage = _DsMessageWithCtx
+_DsMessage = prism' GhcDsMessage $ \case
+  GhcDsMessage dsmsg -> Just dsmsg
+  _ -> Nothing
 
-_DsMessageWithCtx :: Prism' GhcMessage DsMessage
-_DsMessageWithCtx = prism' GhcDsMessage (\case
-  GhcDsMessage x -> Just x
-  _ -> Nothing)
+showPpr ::  Outputable a => a -> String
+showPpr = showSDocUnsafe . ppr

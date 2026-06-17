@@ -2,7 +2,11 @@
 {-# OPTIONS_GHC -Wall #-}
 module T1 where
 
-data X = X | Y
+data X = A
+       | B
+       | C Int
+       | D Int Int
+       | E
 
 x :: Int
 x = case undefined :: X of

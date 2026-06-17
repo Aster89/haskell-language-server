@@ -150,7 +150,7 @@ import           GHC.Types.HpcInfo                            (emptyHpcInfo)
 #if MIN_VERSION_ghc(9,11,0)
 import qualified Data.List.NonEmpty                           as NE
 import           Data.Time                                    (getCurrentTime)
-import           GHC.Driver.Env                               (hsc_all_home_unit_ids, runHsc')
+import           GHC.Driver.Env                               (hsc_all_home_unit_ids)
 import           GHC.Iface.Ext.Types                          (NameEntityInfo)
 #endif
 
@@ -164,10 +164,6 @@ import           GHC.Types.Avail                              (emptyDetOrdAvails
 
 #if MIN_VERSION_ghc(9,12,0)
 import           Development.IDE.Import.FindImports
-import GHC.Driver.Main (hscDesugar', hscSimplify')
-import GHC.Driver.Config.Diagnostic (initPrintConfig)
-import GHC.Driver.Errors (printOrThrowDiagnostics)
-import GHC.Plugins (DynFlags(..))
 #endif
 
 --Simple constants to make sure the source is consistently named
