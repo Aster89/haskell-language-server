@@ -7,6 +7,7 @@ data X = A
        | C Int
        | D Int Int
        | E
+       | F
 
 x :: Int
 x = case undefined :: X of
@@ -15,3 +16,4 @@ x = case undefined :: X of
             C _ -> _
             D _ _ -> _
             E -> _
+            F -> _
