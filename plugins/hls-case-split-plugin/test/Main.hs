@@ -59,6 +59,7 @@ getActionByTitle title actions = case find (\a -> a ^. L.title == title) actions
 expectCodeActionsAvailable :: TestName -> FilePath -> [T.Text] -> TestTree
 expectCodeActionsAvailable title path actionTitles =
   testCase title $ do
+    -- TODO: use runSessionWithServerInTmpDir instead
     runSessionWithServer def caseSplitPlugin testDataDir $ do
       doc <- openDoc (path <.> "hs") "haskell"
       _ <- waitForDiagnosticsFrom doc

@@ -671,7 +671,6 @@ compileModule (RunSimplifier simplify) session ms tcg =
   catchSrcErrors (hsc_dflags session) compilePhase compileAction
        >>= \case Left diags             -> pure (diags, Nothing)
                  Right (diags, modGuts) -> pure (diags, Just modGuts)
-
   where
     compilePhase = "compile"
     compileAction = do
