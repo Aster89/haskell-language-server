@@ -59,7 +59,7 @@ suggestCaseSplitProvider
   state
   _
   CodeActionParams{ _textDocument = TextDocumentIdentifier{..}
-                  , _range = range
+                  , _context = CodeActionContext{ _diagnostics = Diagnostic { _range = range }:_ }
                   }
   = do
   nfp <- getNormalizedFilePathE _uri
@@ -102,6 +102,8 @@ suggestCaseSplitProvider
         (Just $ M.singleton _uri $ [textEdit msg])
         Nothing
         Nothing
+
+suggestCaseSplitProvider _ _ _ = pure $ InL []
 
 _DsMessage :: Fold GhcMessage DsMessage
 _DsMessage = prism' GhcDsMessage $ \case
