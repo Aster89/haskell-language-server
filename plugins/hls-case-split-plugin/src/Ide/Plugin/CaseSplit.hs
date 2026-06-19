@@ -63,14 +63,15 @@ suggestCaseSplitProvider
 
   case mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage) diags of
     [dsmsg] -> do
-      pure $ InL [InR (CodeAction "Add placeholders for all missing patterns"
-                                  (Just CodeActionKind_QuickFix)
-                                  Nothing
-                                  Nothing
-                                  Nothing
-                                  (Just $ pmAltsToWorkspaceEdit $ dsMsgToPmAlts dsmsg)
-                                  Nothing
-                                  Nothing)]
+      pure $ InL [InR
+        $ CodeAction { _title       = "Add placeholders for all missing patterns"
+                     , _kind        = Just CodeActionKind_QuickFix
+                     , _diagnostics = Nothing -- TODO: I should probably encode here that it addresses the DsNonExhaustivePatterns diag
+                     , _isPreferred = Nothing -- TODO: Just True?
+                     , _disabled    = Nothing
+                     , _edit        = Just $ pmAltsToWorkspaceEdit $ dsMsgToPmAlts dsmsg
+                     , _command     = Nothing
+                     , _data_       = Nothing }]
     _ -> error "Oops, unexpected number of messages!"
 
   where
@@ -94,10 +95,11 @@ suggestCaseSplitProvider
                                . T.lines
                    in TextEdit pragmaInsertRange $ "\n" `T.append` extract msg
     edit msg =
-      WorkspaceEdit
-        (Just $ M.singleton _uri $ [textEdit msg])
-        Nothing
-        Nothing
+      WorkspaceEdit {
+        _changes = Just $ M.singleton _uri $ [textEdit msg]
+      , _documentChanges = Nothing
+      , _changeAnnotations = Nothing
+      }
 
 suggestCaseSplitProvider _ _ _ = pure $ InL []
 
