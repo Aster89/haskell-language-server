@@ -51,9 +51,9 @@ makeMethodDecl df (mName, sig) = do
     pure (name, sig')
 
 #if MIN_VERSION_ghc_exactprint(1,10,0)
-addMethodDecls :: ParsedSource -> [(LHsDecl GhcPs, LHsDecl GhcPs)] -> Range -> Bool -> Located (HsModule GhcPs)
+addMethodDecls :: ParsedSource -> [(LHsDecl GhcPs, LHsDecl GhcPs)] -> Range -> Bool -> ParsedSource
 #else
-addMethodDecls :: ParsedSource -> [(LHsDecl GhcPs, LHsDecl GhcPs)] -> Range -> Bool -> TransformT Identity (Located (HsModule GhcPs))
+addMethodDecls :: ParsedSource -> [(LHsDecl GhcPs, LHsDecl GhcPs)] -> Range -> Bool -> TransformT Identity ParsedSource
 #endif
 addMethodDecls ps mDecls range withSig
     | withSig = go (concatMap (\(decl, sig) -> [sig, decl]) mDecls)
@@ -66,6 +66,7 @@ addMethodDecls ps mDecls range withSig
         allDecls <- hsDecls ps
 #endif
         case break (inRange range . getLoc) allDecls of
+            (before, []) -> replaceDecls ps before
             (before, L l inst : after) ->
                 let
                     indent = case inst of
@@ -105,8 +106,6 @@ addMethodDecls ps mDecls range withSig
                     resetFollowing = id
 #endif
                 in replaceDecls ps (before ++ L l (addWhere inst):(map newLine inserting ++ resetFollowing after))
-            (before, []) ->
-                replaceDecls ps before
 
     -- Add `where` keyword for `instance X where` if `where` is missing.
     --
