@@ -46,6 +46,7 @@ import Ide.PluginUtils (subRange)
 import Control.Monad (MonadPlus(mplus, mzero))
 import Language.Haskell.Syntax (HsModule)
 import Language.Haskell.Syntax.Decls (HsDecl (ValD))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase))
 
 inRange :: Range -> SrcSpan -> Bool
 inRange range s = maybe False (subRange range) (srcSpanToRange s)
@@ -164,23 +165,14 @@ makeEditText :: Monad m => ParsedModule -> MissingPatterns -> Range -> MaybeT m 
 makeEditText pm missingPatterns range = do
 
   -- BEGIN experiment with astTraversalWith
-  let !foo = traceWith (show . typeOf)
-           $ astTraversalWith (pm_parsed_source pm :: Located (HsModule GhcPs))
-                              (\node -> case eqTypeRep (typeRep @EpAnnHsCase) (typeOf node) of
-                Nothing -> Nothing
-                Just HRefl -> case node :: EpAnnHsCase of
-                  EpAnnHsCase c _ | inRange range (getHasLoc c) -> Just node
-                  _ -> Nothing
-                )
-  let !foo = traceWith (show . typeOf)
+  let !foo = traceWith (("Hello: " ++) . show . typeOf)
            $ astTraversalWith (pm_parsed_source pm)
-                              (\node -> case eqTypeRep (typeRep @(HsDecl GhcPs)) (typeOf node) of
+                              (\node -> case eqTypeRep (typeRep @(HsExpr GhcPs)) (typeOf node) of
                 Nothing -> []
-                Just HRefl -> case node :: (HsDecl GhcPs) of
-                  ValD _ _ -> [node]
+                Just HRefl -> case node :: HsExpr GhcPs of
+                  HsCase _ _ _ -> trace "Hello again!" $ [node]
                   _ -> []
                 )
-
   -- END experiment with astTraversalWith
   let ps = pm_parsed_source pm
       old = T.pack $ exactPrint ps
