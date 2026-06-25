@@ -576,6 +576,34 @@ test-suite hls-explicit-imports-plugin-tests
     , text
 
 -----------------------------
+-- case split plugin
+-----------------------------
+
+flag foobar
+  description: Enable foobar plugin
+  default:     True
+  manual:      True
+
+common foobar
+  if flag(foobar)
+    build-depends: haskell-language-server:hls-case-split-plugin
+    cpp-options: -Dhls_caseSplit
+
+library hls-case-split-plugin
+  import:           defaults, pedantic, warnings
+  if !flag(foobar)
+    buildable: False
+  exposed-modules:  Ide.Plugin.Foobar
+  hs-source-dirs:   plugins/hls-case-split-plugin/src
+  build-depends:
+    , ghcide                == 2.14.0.0
+    , hls-plugin-api        == 2.14.0.0
+    , lsp
+
+  default-extensions:
+    DataKinds
+
+-----------------------------
 -- rename plugin
 -----------------------------
 
@@ -1859,6 +1887,7 @@ library
                   , class
                   , eval
                   , importLens
+                  , foobar
                   , rename
                   , hlint
                   , stan

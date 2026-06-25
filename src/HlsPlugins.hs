@@ -35,7 +35,9 @@ import qualified Ide.Plugin.Eval                   as Eval
 import qualified Ide.Plugin.ExplicitImports        as ExplicitImports
 #endif
 
-
+#if hls_foobar
+import qualified Ide.Plugin.Foobar              as Foobar
+#endif
 
 #if hls_rename
 import qualified Ide.Plugin.Rename                 as Rename
@@ -195,6 +197,9 @@ idePlugins recorder = pluginDescToIdePlugins allPlugins
 #endif
 #if hls_importLens
       let pId = "importLens" in ExplicitImports.descriptor (pluginRecorder pId) pId:
+#endif
+#if hls_foobar
+      let pId = "foobar" in Foobar.descriptor (pluginRecorder pId) pId:
 #endif
 #if hls_qualifyImportedNames
       QualifyImportedNames.descriptor "qualifyImportedNames" :
