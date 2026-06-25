@@ -30,7 +30,7 @@ import           Development.IDE.Core.Compile             (sourceParser,
                                                            sourceTypecheck)
 import           Development.IDE.Core.FileStore           (getVersionedTextDoc)
 import           Development.IDE.Core.PluginUtils
-import           Development.IDE.GHC.Compat
+import           Development.IDE.GHC.Compat (DynFlags, xFlags) -- TODO: remove xFlags here and ask HLS to put it back
 import           Development.IDE.GHC.Compat.Error         (GhcHint (SuggestExtension),
                                                            LanguageExtensionHint (..),
                                                            diagnosticHints,
@@ -45,6 +45,8 @@ import qualified Language.LSP.Protocol.Lens               as L
 import qualified Language.LSP.Protocol.Message            as LSP
 import qualified Language.LSP.Protocol.Types              as LSP
 import qualified Text.Fuzzy                               as Fuzzy
+import Development.IDE.GHC.Compat.Core (FlagSpec(..))
+import Development.IDE.GHC.Compat.Core (Extension)
 
 -- ---------------------------------------------------------------------
 
