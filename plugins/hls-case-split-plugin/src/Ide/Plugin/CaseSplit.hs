@@ -165,13 +165,13 @@ makeEditText :: Monad m => ParsedModule -> MissingPatterns -> Range -> MaybeT m 
 makeEditText pm missingPatterns range = do
 
   -- BEGIN experiment with astTraversalWith
-  let !foo = traceWith (("Hello: " ++) . show . typeOf)
-           $ astTraversalWith (pm_parsed_source pm)
+  let !foo = astTraversalWith (pm_parsed_source pm)
                               (\node -> case eqTypeRep (typeRep @(HsExpr GhcPs)) (typeOf node) of
-                Nothing -> []
+                Nothing -> Nothing
                 Just HRefl -> case node :: HsExpr GhcPs of
-                  HsCase _ _ _ -> trace "Hello again!" $ [node]
-                  _ -> []
+                  HsCase _ e _ | getHasLoc e `inRange` range -> trace "The case I want!" $ Just node
+                  HsCase _ _ _ -> trace "Another case" $ Nothing
+                  _ -> Nothing
                 )
   -- END experiment with astTraversalWith
   let ps = pm_parsed_source pm
