@@ -609,6 +609,7 @@ library hls-case-split-plugin
     , lens
     , lsp
     , mtl
+    , syb
     , text
     , transformers
 
