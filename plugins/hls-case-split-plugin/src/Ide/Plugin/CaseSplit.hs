@@ -31,7 +31,8 @@ import Data.Maybe (mapMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types
 import GHC.Types.Unique.SDFM
-import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), ParsedSource, HasLoc (getHasLoc))
+import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), ParsedSource, HasLoc (getHasLoc), realSrcSpan, srcSpanStartLine, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
+import Development.IDE.GHC.Compat (getLoc)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Maybe
 import Development.IDE.GHC.Compat.ExactPrint
@@ -41,14 +42,17 @@ import Debug.Trace
 import Type.Reflection (eqTypeRep,
                         type (:~~:) (HRefl),
                         typeRep, typeOf)
-import GHC.Hs (GhcPs)
-import GHC.Types.SrcLoc (SrcSpan)
+import GHC.Hs (GhcPs, deltaPos)
+import GHC.Types.SrcLoc (SrcSpan, GenLocated (L))
 import Control.Monad (MonadPlus(mplus, mzero))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (Match))
 import Control.Monad.Trans (lift)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import qualified Language.LSP.Protocol.Lens                   as L
+import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr)
+import Language.Haskell.GHC.ExactPrint.Utils
+import GHC (EpAnn(EpAnn))
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -120,7 +124,7 @@ suggestCaseSplitProvider
                      , _diagnostics = Nothing -- TODO: I should probably encode here that it addresses the DsNonExhaustivePatterns diag
                      , _isPreferred = Nothing -- TODO: Just True?
                      , _disabled    = Nothing
-                     , _edit        = Just $ pmAltsToWorkspaceEdit $ pmAltsConApp
+                     , _edit        = Just edit
                      , _command     = Nothing
                      , _data_       = Nothing }]
     _ -> error "Oops, unexpected number of messages!"
@@ -170,8 +174,6 @@ _DsMessage = prism' GhcDsMessage $ \case
 showPpr ::  Outputable a => a -> String
 showPpr = showSDocUnsafe . ppr
 
-type MissingPatterns = [PmAltConApp]
-
 makeEditText :: Monad m => ParsedModule -> MissingPatterns -> Range -> MaybeT m (T.Text, T.Text)
 makeEditText pm missingPs range = do
 
@@ -204,23 +206,44 @@ makeEditText pm missingPs range = do
 
     where
       f :: forall d. Data d => d -> d
-      f = \node -> case eqTypeRep (typeRep @(HsExpr GhcPs)) (typeOf node) of
+      f = \node -> case eqTypeRep (typeOf node) (typeRep @(HsExpr GhcPs)) of
                 Nothing -> node
                 Just HRefl -> case node :: HsExpr GhcPs of
-                  (HsCase x e existingPs) | getHasLoc e `inRange` range
-                                 -> trace ("I should change this `case`! It's got these patterns already = "
+                  h@(HsCase x e existingPs) | getHasLoc e `inRange` range
+                                 -> let (braced, alts) = case mg_alts existingPs of
+                                              (L (EpAnn _ (AnnList _ (ListBraces _ _) _ _ _) _) ls) -> (True, ls)
+                                              (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
+                                              _ -> error "Ooops"
+                                        indent = case alts of
+                                              (l:_) -> srcSpanStartCol $ realSrcSpan $ getLoc $ l
+                                              _ -> trace "underscore" $ case hsCaseAnnCase x of
+                                                      EpTok (EpaSpan l) -> srcSpanStartCol (realSrcSpan $ getLoc $ l) + defaultIndent
+                                                      _ -> error "Missing `case` keyword???"
+                                    in trace ("I should change this `case`! It's got these patterns already = "
                                            ++ show (exactPrint existingPs)
-                                           ++ " but I should add the missing ones coming from the diagnostics")
-                                  $ HsCase x e $ -- _ missingPs
-                                                      existingPs
+                                           ++ " but I should add the missing ones coming from the diagnostics"
+                                           ++ showAst h
+                                           ++ '\n':"")
+                                  $ HsCase x e $ addMissingPatterns missingPs existingPs
 
                   HsCase _ _ _ -> trace "Leave this `case`"
                                 $ node
 
                   _ -> node
+      defaultIndent = 2
 
-addMissingPatterns :: ParsedSource -> MissingPatterns -> Range -> ParsedSource
-addMissingPatterns ps _ _ = ps -- TODO: implement this
+addMissingPatterns :: MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+addMissingPatterns m e@(MG { mg_alts = L l a })
+  = let (a':_) = a -- ++ fmap _ m
+        methodEpAnn = noAnnSrcSpanDP $ deltaPos 1 $ (srcSpanStartCol (realSrcSpan $ getLoc a')
+                                                   - srcSpanStartCol (realSrcSpan $ getLoc $ mg_alts e))
+        newLine (L _ e) = L methodEpAnn e
+    in e { mg_alts = L l (a ++ map (newLine . foo) m) }
+
+foo :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
+foo _ = L _ $ Match { m_ext = _, m_pats = L _ _ }
+
+type MissingPatterns = [PmAltConApp]
 
 {-
  -
