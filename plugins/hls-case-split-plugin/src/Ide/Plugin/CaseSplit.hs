@@ -25,13 +25,14 @@ import qualified Language.LSP.Protocol.Message            as LSP
 import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags))
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName))
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Data.Maybe (mapMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
-import GHC.HsToCore.Pmc.Solver.Types
+import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..))
 import GHC.Types.Unique.SDFM
-import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), ParsedSource, HasLoc (getHasLoc), realSrcSpan, srcSpanStartLine, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
+import GHC.Types.Name.Reader (nameRdrName)
+import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
 import Development.IDE.GHC.Compat (getLoc)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Maybe
@@ -45,12 +46,12 @@ import Type.Reflection (eqTypeRep,
 import GHC.Hs (GhcPs, deltaPos)
 import GHC.Types.SrcLoc (SrcSpan, GenLocated (L))
 import Control.Monad (MonadPlus(mplus, mzero))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (Match))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (..))
 import Control.Monad.Trans (lift)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import qualified Language.LSP.Protocol.Lens                   as L
-import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr)
+import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon))
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
 
@@ -241,7 +242,16 @@ addMissingPatterns m e@(MG { mg_alts = L l a })
     in e { mg_alts = L l (a ++ map (newLine . foo) m) }
 
 foo :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
-foo _ = L _ $ Match { m_ext = _, m_pats = L _ _ }
+foo PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
+      = L _ $ Match { m_ext = NoExtField
+                    , m_ctxt = CaseAlt
+                    , m_pats = L _ $ [L _ ConPat { pat_con_ext = (Nothing, Nothing)
+                                                 , pat_con = L _ (nameRdrName $ getName ctor)
+                                                 , pat_args = PrefixCon $ map (const (L _ (WildPat NoExtField))) paca_ids
+                                                 }]
+                    , m_grhss = _
+                    }
+foo _ = error "boom"
 
 type MissingPatterns = [PmAltConApp]
 
