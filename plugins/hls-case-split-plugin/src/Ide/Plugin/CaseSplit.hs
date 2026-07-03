@@ -25,11 +25,11 @@ import qualified Language.LSP.Protocol.Message            as LSP
 import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName))
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), noSrcSpan)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Data.Maybe (mapMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
-import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..))
+import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
 import GHC.Types.Name.Reader (nameRdrName)
 import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
@@ -43,17 +43,19 @@ import Debug.Trace
 import Type.Reflection (eqTypeRep,
                         type (:~~:) (HRefl),
                         typeRep, typeOf)
-import GHC.Hs (GhcPs, deltaPos)
+import GHC.Hs (GhcPs, deltaPos, HasAnnotation (noAnnSrcSpan))
 import GHC.Types.SrcLoc (SrcSpan, GenLocated (L))
 import Control.Monad (MonadPlus(mplus, mzero))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (..))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (..), GRHSs (GRHSs, XGRHSs), GRHS (GRHS))
 import Control.Monad.Trans (lift)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import qualified Language.LSP.Protocol.Lens                   as L
-import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon))
+import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds), DataConCantHappen)
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
+import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn))
+import Data.List.NonEmpty.Extra (singleton)
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -211,21 +213,21 @@ makeEditText pm missingPs range = do
                 Nothing -> node
                 Just HRefl -> case node :: HsExpr GhcPs of
                   h@(HsCase x e existingPs) | getHasLoc e `inRange` range
-                                 -> let (braced, alts) = case mg_alts existingPs of
-                                              (L (EpAnn _ (AnnList _ (ListBraces _ _) _ _ _) _) ls) -> (True, ls)
-                                              (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
-                                              _ -> error "Ooops"
-                                        indent = case alts of
-                                              (l:_) -> srcSpanStartCol $ realSrcSpan $ getLoc $ l
-                                              _ -> trace "underscore" $ case hsCaseAnnCase x of
-                                                      EpTok (EpaSpan l) -> srcSpanStartCol (realSrcSpan $ getLoc $ l) + defaultIndent
-                                                      _ -> error "Missing `case` keyword???"
-                                    in trace ("I should change this `case`! It's got these patterns already = "
-                                           ++ show (exactPrint existingPs)
-                                           ++ " but I should add the missing ones coming from the diagnostics"
-                                           ++ showAst h
-                                           ++ '\n':"")
-                                  $ HsCase x e $ addMissingPatterns missingPs existingPs
+                     -> let (braced, alts) = case mg_alts existingPs of
+                                  (L (EpAnn _ (AnnList _ (ListBraces _ _) _ _ _) _) ls) -> (True, ls)
+                                  (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
+                                  _ -> error "Ooops"
+                            indent = case alts of
+                                  (l:_) -> srcSpanStartCol $ realSrcSpan $ getLoc $ l
+                                  _ -> trace "underscore" $ case hsCaseAnnCase x of
+                                          EpTok (EpaSpan l) -> srcSpanStartCol (realSrcSpan $ getLoc $ l) + defaultIndent
+                                          _ -> error "Missing `case` keyword???"
+                        in trace ("I should change this `case`! It's got these patterns already = "
+                               ++ show (exactPrint existingPs)
+                               ++ " but I should add the missing ones coming from the diagnostics"
+                               ++ showAst h
+                               ++ '\n':"")
+                      $ HsCase x e $ addMissingPatterns missingPs existingPs
 
                   HsCase _ _ _ -> trace "Leave this `case`"
                                 $ node
@@ -234,24 +236,31 @@ makeEditText pm missingPs range = do
       defaultIndent = 2
 
 addMissingPatterns :: MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
-addMissingPatterns m e@(MG { mg_alts = L l a })
-  = let (a':_) = a -- ++ fmap _ m
-        methodEpAnn = noAnnSrcSpanDP $ deltaPos 1 $ (srcSpanStartCol (realSrcSpan $ getLoc a')
-                                                   - srcSpanStartCol (realSrcSpan $ getLoc $ mg_alts e))
+addMissingPatterns missing mg@(MG { mg_alts = mg_alts@(L l (a:as)) })
+  = let methodEpAnn = noAnnSrcSpanDP
+                    $ deltaPos 1
+                    $ (srcSpanStartCol (realSrcSpan $ getLoc a)
+                     - srcSpanStartCol (realSrcSpan $ getLoc mg_alts))
         newLine (L _ e) = L methodEpAnn e
-    in e { mg_alts = L l (a ++ map (newLine . foo) m) }
+    in mg { mg_alts = L l (as ++ map (newLine . makeMatch) missing) }
+addMissingPatterns _ mg = mg
 
-foo :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
-foo PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
-      = L _ $ Match { m_ext = NoExtField
+
+makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
+makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
+      = L noSrcSpanA
+            $ Match { m_ext = NoExtField
                     , m_ctxt = CaseAlt
-                    , m_pats = L _ $ [L _ ConPat { pat_con_ext = (Nothing, Nothing)
-                                                 , pat_con = L _ (nameRdrName $ getName ctor)
-                                                 , pat_args = PrefixCon $ map (const (L _ (WildPat NoExtField))) paca_ids
+                    , m_pats = L noSrcSpanA $ [L noSrcSpanA ConPat { pat_con_ext = (Nothing, Nothing)
+                                                 , pat_con = L noSrcSpanA (nameRdrName $ getName ctor)
+                                                 , pat_args = PrefixCon $ map (const (L noSrcSpanA (WildPat NoExtField))) paca_ids
                                                  }]
-                    , m_grhss = _
+                    -- , m_grhss = XGRHSs (error "boom" :: DataConCantHappen)
+                    , m_grhss = GRHSs (EpaComments [])
+                                      (singleton (L noSrcSpanA $ GRHS noAnn [] $ L noSrcSpanA _))
+                                      (EmptyLocalBinds NoExtField)
                     }
-foo _ = error "boom"
+makeMatch _ = error "boom"
 
 type MissingPatterns = [PmAltConApp]
 
