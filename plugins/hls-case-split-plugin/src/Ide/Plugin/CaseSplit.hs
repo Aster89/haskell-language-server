@@ -25,13 +25,13 @@ import qualified Language.LSP.Protocol.Message            as LSP
 import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), noSrcSpan)
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), mkVarOcc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Data.Maybe (mapMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
-import GHC.Types.Name.Reader (nameRdrName)
+import GHC.Types.Name.Reader (nameRdrName, mkRdrUnqual)
 import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
 import Development.IDE.GHC.Compat (getLoc)
 import Control.Monad.IO.Class
@@ -43,19 +43,20 @@ import Debug.Trace
 import Type.Reflection (eqTypeRep,
                         type (:~~:) (HRefl),
                         typeRep, typeOf)
-import GHC.Hs (GhcPs, deltaPos, HasAnnotation (noAnnSrcSpan))
-import GHC.Types.SrcLoc (SrcSpan, GenLocated (L))
+import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName)
+import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta))
 import Control.Monad (MonadPlus(mplus, mzero))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase), Match (..), GRHSs (GRHSs, XGRHSs), GRHS (GRHS))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Control.Monad.Trans (lift)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import qualified Language.LSP.Protocol.Lens                   as L
-import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds), DataConCantHappen)
+import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
-import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn))
+import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax))
 import Data.List.NonEmpty.Extra (singleton)
+import Development.IDE.GHC.Compat.Core (GrhsAnn(..))
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -75,7 +76,7 @@ descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeSta
 descriptor _ plId = (defaultPluginDescriptor plId "Provides a code action to split case")
   { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction suggestCaseSplitProvider
   , pluginPriority = 1
-  , pluginModifyDynflags = mempty { dynFlagsModifyGlobal = \dynFlags -> dynFlags { maxUncoveredPatterns = 20 } }
+  , pluginModifyDynflags = mempty { dynFlagsModifyGlobal = \dynFlags -> dynFlags { maxUncoveredPatterns = 30 } }
   }
 
 astTraversalWith :: forall b r m. (MonadPlus m, Data b) => b -> (forall a. Data a => a -> m r) -> m r
@@ -98,9 +99,9 @@ suggestCaseSplitProvider
   pm <- runActionE "not important, as long as unique" state
       $ useE GetParsedModule nfp
 
-  (hsc_dflags . hscEnv -> df)
-    <- runActionE "classplugin.addMethodPlaceholders.GhcSessionDeps" state
-      $ useE GhcSessionDeps nfp
+  -- (hsc_dflags . hscEnv -> df)
+  --   <- runActionE "classplugin.addMethodPlaceholders.GhcSessionDeps" state
+  --     $ useE GhcSessionDeps nfp
 
   diags :: [FileDiagnostic] <- activeDiagnosticsInRange (shakeExtras state) nfp range
                                 <&> \case Nothing -> error "Oops, no diagnostics!"
@@ -109,7 +110,10 @@ suggestCaseSplitProvider
   case mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage
                                                . msgEnvelopeErrorL
                                                . _DsMessage) diags of
-    [dsmsg] -> do
+    [dsmsg] -- TODO: I need to filter for the diagnostic I want.
+            -- It might important to check the case of two nested `case`
+            -- expressions, both with non-exhaustive patterns.
+            -> do
       let pmAltsConApp = dsMsgToPmAlts dsmsg
 
       (old, new) <- handleMaybeM (PluginInternalError "Unable to makeEditText")
@@ -209,9 +213,9 @@ makeEditText pm missingPs range = do
 
     where
       f :: forall d. Data d => d -> d
-      f = \node -> case eqTypeRep (typeOf node) (typeRep @(HsExpr GhcPs)) of
+      f = \node -> case typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs) of
                 Nothing -> node
-                Just HRefl -> case node :: HsExpr GhcPs of
+                Just HRefl -> case node of
                   h@(HsCase x e existingPs) | getHasLoc e `inRange` range
                      -> let (braced, alts) = case mg_alts existingPs of
                                   (L (EpAnn _ (AnnList _ (ListBraces _ _) _ _ _) _) ls) -> (True, ls)
@@ -242,24 +246,31 @@ addMissingPatterns missing mg@(MG { mg_alts = mg_alts@(L l (a:as)) })
                     $ (srcSpanStartCol (realSrcSpan $ getLoc a)
                      - srcSpanStartCol (realSrcSpan $ getLoc mg_alts))
         newLine (L _ e) = L methodEpAnn e
-    in mg { mg_alts = L l (as ++ map (newLine . makeMatch) missing) }
-addMissingPatterns _ mg = mg
+    in mg { mg_alts = L l (a:as ++ map (newLine . makeMatch) missing) }
+addMissingPatterns _ mg = mg -- TODO this is the case where no exiting pattern is listed
 
 
 makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
       = L noSrcSpanA
-            $ Match { m_ext = NoExtField
-                    , m_ctxt = CaseAlt
-                    , m_pats = L noSrcSpanA $ [L noSrcSpanA ConPat { pat_con_ext = (Nothing, Nothing)
-                                                 , pat_con = L noSrcSpanA (nameRdrName $ getName ctor)
-                                                 , pat_args = PrefixCon $ map (const (L noSrcSpanA (WildPat NoExtField))) paca_ids
-                                                 }]
-                    -- , m_grhss = XGRHSs (error "boom" :: DataConCantHappen)
-                    , m_grhss = GRHSs (EpaComments [])
-                                      (singleton (L noSrcSpanA $ GRHS noAnn [] $ L noSrcSpanA _))
-                                      (EmptyLocalBinds NoExtField)
-                    }
+        $ Match { m_ext = NoExtField
+                , m_ctxt = CaseAlt
+                , m_pats = L noSrcSpanA
+                         $ [L noSrcSpanA ConPat { pat_con_ext = (Nothing, Nothing)
+                                                , pat_con = L noSrcSpanA $ nameRdrName $ getName ctor
+                                                , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
+                                                }]
+                , m_grhss = GRHSs (EpaComments [])
+                                  -- TODO: remember to respect unicode arrow of preceeding cases or the -XUnicodeSyntax (https://downloads.haskell.org/ghc/latest/docs/users_guide/exts/unicode_syntax.html#extension-UnicodeSyntax)
+                                  -- TODO: check whether ga_sep default choice is really not printing anything.
+                                  (singleton $ L noSrcSpanA $ GRHS (EpAnn noSrcSpanA
+                                                                          (GrhsAnn{ ga_vbar = Nothing
+                                                                                  , ga_sep = Right (EpUniTok d1 NormalSyntax) })
+                                                                          (EpaComments [])) []
+                                                            $ L noSrcSpanA $ HsHole $ HoleVar $ L noAnnSrcSpanDP1
+                                             $ unnamedHoleRdrName)
+                                  (EmptyLocalBinds NoExtField)
+                }
 makeMatch _ = error "boom"
 
 type MissingPatterns = [PmAltConApp]
