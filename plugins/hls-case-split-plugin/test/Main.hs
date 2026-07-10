@@ -34,11 +34,13 @@ codeActionTests = testGroup
   [ expectCodeActionsAvailable "Produces addMinimalMethodPlaceholders code actions for one instance" "T1"
       [ "Add placeholders for all missing patterns"
       ]
-  , goldenWithClass "No patterns and no braces" "T1" "eq" $
+  , goldenWithClass "No patterns, no braces" "T1" "eq" $
       getActionByTitle "Add placeholders for all missing patterns"
-  , goldenWithClass "Some patterns and no braces" "T2" "eq" $
+  , goldenWithClass "Some patterns, no braces" "T2" "eq" $
       getActionByTitle "Add placeholders for all missing patterns"
-  , goldenWithClass "Some patterns and braces" "T3" "eq" $
+  , goldenWithClass "Some patterns, with braces" "T3" "eq" $
+      getActionByTitle "Add placeholders for all missing patterns"
+  , goldenWithClass "No patterns, with braces" "T4" "eq" $
       getActionByTitle "Add placeholders for all missing patterns"
   ]
 

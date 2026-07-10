@@ -1,6 +1,6 @@
 {-# LANGUAGE EmptyCase #-}
 {-# OPTIONS_GHC -Wall #-}
-module T2 where
+module T3 where
 
 data X = A
        | B

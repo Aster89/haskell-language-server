@@ -27,7 +27,7 @@ import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
 import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), mkVarOcc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
-import Data.Maybe (mapMaybe, listToMaybe, fromMaybe)
+import Data.Maybe (mapMaybe, listToMaybe, fromMaybe, isJust)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
@@ -54,10 +54,11 @@ import qualified Language.LSP.Protocol.Lens                   as L
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
-import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax), emptyComments, TrailingAnn (AddSemiAnn), SrcSpanAnnA)
+import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax), emptyComments, TrailingAnn (AddSemiAnn), SrcSpanAnnA, addTrailingAnnToA)
 import Data.List.NonEmpty.Extra (singleton)
-import Development.IDE.GHC.Compat.Core (GrhsAnn(..), AnnListItem (AnnListItem), HasSrcSpan, srcSpanStart, EpAnnHsCase (..))
+import Development.IDE.GHC.Compat.Core (GrhsAnn(..), AnnListItem (AnnListItem, lann_trailing), HasSrcSpan, srcSpanStart, EpAnnHsCase (..))
 import Data.List.Extra (allSame)
+import Data.List (find)
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -239,7 +240,7 @@ makeEditText pm missingPs range = do
                                          , "braced = " ++ show braced
                                          , "indent = " ++ show indent
                                          , "onelined = " ++ show onelined]) $
-                          HsCase x e $ addMissingPatterns (indent - fromMaybe 0 braced) missingPs existingPs
+                          HsCase x e $ addMissingPatterns braced (indent - fromMaybe 0 braced) missingPs existingPs
                   _ -> node
 
 getStartCol :: HasSrcSpan a => a -> Int
@@ -251,17 +252,42 @@ newIndentedLn indent (L _ e) = L l e
                   (AnnListItem [])
                   emptyComments
 
-addMissingPatterns :: Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
-addMissingPatterns indent missing mg@(MG { mg_alts = L l [] })
-  = mg { mg_alts = L l       (zipWith ($)
-                                      (newIndentedLn indent:repeat (newIndentedLn 0))
-                                      (makeMatch <$> missing)) }
-addMissingPatterns _ missing mg@(MG { mg_alts = L l as })
-  = let indent = getStartCol (getLoc l) in
-    mg { mg_alts = L l (as ++ zipWith ($)
-                                      (newIndentedLn 0:repeat (newIndentedLn 0))
-                                      (makeMatch <$> missing)) }
-    -- TODO: In the braced case, `a` should be added semicolon if it doesn't have it yet
+skip1Space :: GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
+skip1Space (L _ e) = L l e
+  where l = EpAnn (EpaDelta noSrcSpanA (deltaPos 0 1) [])
+                  (AnnListItem [])
+                  emptyComments
+
+addSemiCol :: GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
+addSemiCol (L l e) = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
+
+addMissingPatterns :: Maybe Int -> Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+-- No existing patterns, nor braces
+addMissingPatterns Nothing indent missing mg@(MG { mg_alts = L l [] })
+  = mg { mg_alts = L l       (zipWith ($) (newIndentedLn indent:repeat (newIndentedLn 0))
+                                          (makeMatch <$> missing)) }
+-- Some existing patterns, no braces
+addMissingPatterns Nothing _ missing mg@(MG { mg_alts = L l as })
+  = mg { mg_alts = L l (as ++ zipWith ($) (newIndentedLn 0:repeat (newIndentedLn 0))
+                                          (makeMatch <$> missing)) }
+-- No existing patterns, with braces
+addMissingPatterns (Just _) _ missing mg@(MG { mg_alts = L l [] })
+  = mg { mg_alts = L l (zipWith3 (.) (replicate (pred $ length missing) addSemiCol ++ [id])
+                                     (skip1Space:repeat (newIndentedLn defaultIndent))
+                                     (makeMatch <$> missing)) }
+-- Some existing patterns, with braces
+addMissingPatterns (Just _) _ missing mg@(MG { mg_alts = L l as })
+  = let (as', a) = case break (\(L (EpAnn _ ls _) _) -> all (not . isSemiCol) $ lann_trailing ls) as of
+                      (_, _:_:_) -> error "Should be impossible, as in braced list of patterns, only the last pattern can lack the ;"
+                      r -> r
+        missing' = a ++ (makeMatch <$> missing)
+    in mg { mg_alts = L l (as' ++ zipWith3 (.) (replicate (pred $ length missing') addSemiCol ++ [id])
+                                               (replicate (length a) id ++ repeat (newIndentedLn 2))
+                                               missing') }
+      where
+        isSemiCol :: TrailingAnn -> Bool
+        isSemiCol (AddSemiAnn _) = True
+        isSemiCol _ = False
 
 makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }

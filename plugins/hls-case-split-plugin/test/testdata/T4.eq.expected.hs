@@ -16,4 +16,4 @@ x = case undefined :: X of
           C _ -> _;
           D _ _ -> _;
           E -> _;
-          F -> _ }
+          F -> _}
