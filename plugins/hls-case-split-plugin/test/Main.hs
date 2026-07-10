@@ -42,6 +42,10 @@ codeActionTests = testGroup
       getActionByTitle "Add placeholders for all missing patterns"
   , goldenWithClass "No patterns, with braces" "T4" "eq" $
       getActionByTitle "Add placeholders for all missing patterns"
+  , goldenWithClass "Some patterns on one line, no braces" "T5" "eq" $
+      getActionByTitle "Add placeholders for all missing patterns"
+  , goldenWithClass "Some patterns on one line, with braces" "T6" "eq" $
+      getActionByTitle "Add placeholders for all missing patterns"
   ]
 
 _CACodeAction :: Prism' (Command |? CodeAction) CodeAction

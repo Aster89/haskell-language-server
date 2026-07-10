@@ -25,14 +25,14 @@ import qualified Language.LSP.Protocol.Message            as LSP
 import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), mkVarOcc)
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar))
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
-import Data.Maybe (mapMaybe, listToMaybe, fromMaybe, isJust)
+import Data.Maybe (mapMaybe, fromMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
-import GHC.Types.Name.Reader (nameRdrName, mkRdrUnqual)
-import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, srcSpanStartCol, EpAnnHsCase (hsCaseAnnCase), EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
+import GHC.Types.Name.Reader (nameRdrName)
+import GHC (DynFlags(maxUncoveredPatterns), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, srcSpanStartCol, EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
 import Development.IDE.GHC.Compat (getLoc)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Maybe
@@ -44,7 +44,7 @@ import Type.Reflection (eqTypeRep,
                         type (:~~:) (HRefl),
                         typeRep, typeOf)
 import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName)
-import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta), srcLocSpan)
+import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta))
 import Control.Monad (MonadPlus(mplus, mzero))
 import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Control.Monad.Trans (lift)
@@ -54,11 +54,10 @@ import qualified Language.LSP.Protocol.Lens                   as L
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
-import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax), emptyComments, TrailingAnn (AddSemiAnn), SrcSpanAnnA, addTrailingAnnToA)
+import GHC.Parser.Annotation (noSrcSpanA, EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax), emptyComments, TrailingAnn (AddSemiAnn), SrcSpanAnnA, addTrailingAnnToA)
 import Data.List.NonEmpty.Extra (singleton)
-import Development.IDE.GHC.Compat.Core (GrhsAnn(..), AnnListItem (AnnListItem, lann_trailing), HasSrcSpan, srcSpanStart, EpAnnHsCase (..))
+import Development.IDE.GHC.Compat.Core (GrhsAnn(..), AnnListItem (AnnListItem, lann_trailing), HasSrcSpan, EpAnnHsCase (..), srcSpanStartLine)
 import Data.List.Extra (allSame)
-import Data.List (find)
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -224,8 +223,8 @@ makeEditText pm missingPs range = do
                                  (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (Nothing, ls)
                                  _ -> error "Ooops"
                            onelined = case alts of
-                                        [_] -> False
-                                        _ -> allSame $ map getStartCol alts
+                                        (_:_:_) -> allSame $ map getStartLine alts
+                                        _ -> False
                            indent = case alts of
                                  (l:_) -> trace "1-based column of the first alternative = " $
                                           traceShowId $
@@ -240,58 +239,66 @@ makeEditText pm missingPs range = do
                                          , "braced = " ++ show braced
                                          , "indent = " ++ show indent
                                          , "onelined = " ++ show onelined]) $
-                          HsCase x e $ addMissingPatterns braced (indent - fromMaybe 0 braced) missingPs existingPs
+                          HsCase x e $ addMissingPatterns onelined braced (indent - fromMaybe 0 braced) missingPs existingPs
                   _ -> node
+
+getStartLine :: HasSrcSpan a => a -> Int
+getStartLine = srcSpanStartLine . realSrcSpan . getLoc
 
 getStartCol :: HasSrcSpan a => a -> Int
 getStartCol = srcSpanStartCol . realSrcSpan . getLoc
 
-newIndentedLn :: Int -> GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
-newIndentedLn indent (L _ e) = L l e
-  where l = EpAnn (EpaDelta noSrcSpanA (deltaPos 1 indent) [])
+deltaEpAnn :: Int -> Int -> GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
+deltaEpAnn linebreaks indent (L _ e) = L l e
+  where l = EpAnn (EpaDelta noSrcSpanA (deltaPos linebreaks indent) [])
                   (AnnListItem [])
                   emptyComments
 
 skip1Space :: GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
-skip1Space (L _ e) = L l e
-  where l = EpAnn (EpaDelta noSrcSpanA (deltaPos 0 1) [])
-                  (AnnListItem [])
-                  emptyComments
+skip1Space = deltaEpAnn 0 1
 
 addSemiCol :: GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
 addSemiCol (L l e) = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
 
-addMissingPatterns :: Maybe Int -> Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
--- No existing patterns, nor braces
-addMissingPatterns Nothing indent missing mg@(MG { mg_alts = L l [] })
-  = mg { mg_alts = L l       (zipWith ($) (newIndentedLn indent:repeat (newIndentedLn 0))
-                                          (makeMatch <$> missing)) }
--- Some existing patterns, no braces
-addMissingPatterns Nothing _ missing mg@(MG { mg_alts = L l as })
-  = mg { mg_alts = L l (as ++ zipWith ($) (newIndentedLn 0:repeat (newIndentedLn 0))
-                                          (makeMatch <$> missing)) }
+addMissingPatterns :: Bool -> Maybe Int -> Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+--No braces, with or without some existing patterns.
+addMissingPatterns onelined Nothing indent missing mg@(MG { mg_alts = L l as })
+  = let indent' = if null as then indent else 0
+        (as', a) = case break (\(L (EpAnn _ ls _) _) -> all (not . isSemiCol) $ lann_trailing ls) as of
+                      (_, _:_:_) -> error "Should be impossible, as in braced list of patterns, only the last pattern can lack the ;"
+                      r -> r
+        displacements = case (as, onelined) of
+                         (_:_:_, True) -> (replicate (pred $ length missing) $ addSemiCol . deltaEpAnn 0 1)
+                         _ -> deltaEpAnn 1 indent':repeat (deltaEpAnn 1 0)
+        missing' = a ++ (makeMatch <$> missing)
+    in mg { mg_alts = L l (as' ++ zipWith3 (.) (replicate (length a) (if onelined then addSemiCol else id) ++ repeat id)
+                                               (replicate (length a) id ++ displacements ++ [skip1Space])
+                                               missing') }
 -- No existing patterns, with braces
-addMissingPatterns (Just _) _ missing mg@(MG { mg_alts = L l [] })
+addMissingPatterns _ (Just _) _ missing mg@(MG { mg_alts = L l [] })
   = mg { mg_alts = L l (zipWith3 (.) (replicate (pred $ length missing) addSemiCol ++ [id])
-                                     (skip1Space:repeat (newIndentedLn defaultIndent))
+                                     (skip1Space:repeat (deltaEpAnn 1 defaultIndent))
                                      (makeMatch <$> missing)) }
 -- Some existing patterns, with braces
-addMissingPatterns (Just _) _ missing mg@(MG { mg_alts = L l as })
+addMissingPatterns onelined (Just _) _ missing mg@(MG { mg_alts = L l as })
   = let (as', a) = case break (\(L (EpAnn _ ls _) _) -> all (not . isSemiCol) $ lann_trailing ls) as of
                       (_, _:_:_) -> error "Should be impossible, as in braced list of patterns, only the last pattern can lack the ;"
                       r -> r
         missing' = a ++ (makeMatch <$> missing)
+        displacement = case (as, onelined) of
+                         (_:_:_, True) -> deltaEpAnn 0 1
+                         _ -> deltaEpAnn 1 defaultIndent
     in mg { mg_alts = L l (as' ++ zipWith3 (.) (replicate (pred $ length missing') addSemiCol ++ [id])
-                                               (replicate (length a) id ++ repeat (newIndentedLn 2))
+                                               (replicate (length a) id ++ repeat displacement)
                                                missing') }
-      where
-        isSemiCol :: TrailingAnn -> Bool
-        isSemiCol (AddSemiAnn _) = True
-        isSemiCol _ = False
+
+isSemiCol :: TrailingAnn -> Bool
+isSemiCol (AddSemiAnn _) = True
+isSemiCol _ = False
 
 makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
-      = L noSrcSpanA
+        = L noSrcSpanA
         $ Match { m_ext = NoExtField
                 , m_ctxt = CaseAlt
                 , m_pats = L noSrcSpanA
@@ -316,61 +323,3 @@ type MissingPatterns = [PmAltConApp]
 
 defaultIndent :: Int
 defaultIndent = 2
-
-{-
- -
-(SourceLoc, [MissingParam]`
-
-11:38
-
-Magnus says:- seek the source location
-- take AST node of the case statement
-... list of alternatives
-- expand the list of alternatives with the missing cases
-- exactprint the entire thing
-
-11:39
-
-
-
-Magnus says:show the resulting AST
-
-11:39
-
-Magnus says:- range
-- the given node that I'm looking at is a case statement
-
-11:41
-
-Magnus says:
-https://hackage-content.haskell.org/package/base-4.22.0.0/docs/Data-Data.html#t:Data
-
-
-11:43
-
-Magnus says:
-https://hackage-content.haskell.org/package/ghc-exactprint-1.14.0.0/docs/Language-Haskell-GHC-ExactPrint-Transform.html
-
-
-11:43
-
-Magnus says:
-https://hackage-content.haskell.org/package/ghc-9.14.1/docs/GHC-Hs-Pat.html#t:Pat
-
-
-https://hackage-content.haskell.org/package/base-4.22.0.0/docs/Data-Data.html#v:gfoldl
-
-
-12:27
-
-
-
-Magnus says:HRefl <- typeOf thing (typeOf (undefined :: HsExpr Ps))
-
-12:28
-
-Magnus says:
-https://github.com/haskell/haskell-language-server/pull/4672/changes#diff-ff019bb7466e44fc95c1d9aab09aab975941acee015706389c8712f53019d6dbR165-R196
-
-
- -}
