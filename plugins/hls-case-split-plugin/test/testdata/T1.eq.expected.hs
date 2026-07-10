@@ -11,9 +11,9 @@ data X = A
 
 x :: Int
 x = case undefined :: X of
-      A -> _
-      B -> _
-      C _ -> _
-      D _ _ -> _
-      E -> _
-      F -> _
+       A -> _
+       B -> _
+       C _ -> _
+       D _ _ -> _
+       E -> _
+       F -> _

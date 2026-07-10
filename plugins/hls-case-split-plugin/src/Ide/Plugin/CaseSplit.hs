@@ -27,7 +27,7 @@ import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
 import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), mkVarOcc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
-import Data.Maybe (mapMaybe, listToMaybe)
+import Data.Maybe (mapMaybe, listToMaybe, fromMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
@@ -219,21 +219,28 @@ makeEditText pm missingPs range = do
                 Just HRefl -> case node of
                   h@(HsCase x e existingPs) | getHasLoc e `inRange` range
                     -> let (braced, alts) = case mg_alts existingPs of
-                                 (L (EpAnn _ (AnnList _ (ListBraces _{- here's the indentation of the { -} _) _ _ _) _) ls) -> (True, ls)
-                                 (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
+                                 (L (EpAnn _ (AnnList _ (ListBraces (EpTok (EpaSpan l)) _) _ _ _) _) ls) -> (Just (getStartCol l), ls)
+                                 (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (Nothing, ls)
                                  _ -> error "Ooops"
-                           onelined = allSame $ map getStartCol alts
+                           onelined = case alts of
+                                        [_] -> False
+                                        _ -> allSame $ map getStartCol alts
                            indent = case alts of
-                                 (l:_) -> getStartCol l
+                                 (l:_) -> trace "1-based column of the first alternative = " $
+                                          traceShowId $
+                                          getStartCol l
                                  _ -> case hsCaseAnnCase x of
-                                         EpTok (EpaSpan l) -> getStartCol l + defaultIndent - 1 -- TODO: understand why -1
+                                         EpTok (EpaSpan l) -> trace "1-based column of `case` = " $
+                                                              traceShowId
+                                                              (getStartCol l)
+                                                              + defaultIndent
                                          _ -> error "Missing `case` keyword???"
-                       in trace (showAst h) $
-                       HsCase x e $ addMissingPatterns indent missingPs existingPs
+                       in trace (unlines [ "AST = " ++ showAst h
+                                         , "braced = " ++ show braced
+                                         , "indent = " ++ show indent
+                                         , "onelined = " ++ show onelined]) $
+                          HsCase x e $ addMissingPatterns (indent - fromMaybe 0 braced) missingPs existingPs
                   _ -> node
-
-defaultIndent :: Int
-defaultIndent = 2
 
 getStartCol :: HasSrcSpan a => a -> Int
 getStartCol = srcSpanStartCol . realSrcSpan . getLoc
@@ -246,10 +253,14 @@ newIndentedLn indent (L _ e) = L l e
 
 addMissingPatterns :: Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
 addMissingPatterns indent missing mg@(MG { mg_alts = L l [] })
-  = mg { mg_alts = L l       (zipWith ($) (newIndentedLn indent:repeat (newIndentedLn 0)) (makeMatch <$> missing)) }
+  = mg { mg_alts = L l       (zipWith ($)
+                                      (newIndentedLn indent:repeat (newIndentedLn 0))
+                                      (makeMatch <$> missing)) }
 addMissingPatterns _ missing mg@(MG { mg_alts = L l as })
   = let indent = getStartCol (getLoc l) in
-    mg { mg_alts = L l (as ++ zipWith ($) (newIndentedLn 0:repeat (newIndentedLn 0)) (makeMatch <$> missing)) }
+    mg { mg_alts = L l (as ++ zipWith ($)
+                                      (newIndentedLn 0:repeat (newIndentedLn 0))
+                                      (makeMatch <$> missing)) }
     -- TODO: In the braced case, `a` should be added semicolon if it doesn't have it yet
 
 makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
@@ -276,6 +287,9 @@ makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
 makeMatch _ = error "boom"
 
 type MissingPatterns = [PmAltConApp]
+
+defaultIndent :: Int
+defaultIndent = 2
 
 {-
  -
