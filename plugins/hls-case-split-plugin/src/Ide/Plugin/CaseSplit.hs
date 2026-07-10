@@ -27,7 +27,7 @@ import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
 import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, HscEnv (hsc_dflags), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), mkVarOcc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, listToMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Types.Unique.SDFM
@@ -44,7 +44,7 @@ import Type.Reflection (eqTypeRep,
                         type (:~~:) (HRefl),
                         typeRep, typeOf)
 import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName)
-import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta))
+import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta), srcLocSpan)
 import Control.Monad (MonadPlus(mplus, mzero))
 import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Control.Monad.Trans (lift)
@@ -54,9 +54,10 @@ import qualified Language.LSP.Protocol.Lens                   as L
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
 import Language.Haskell.GHC.ExactPrint.Utils
 import GHC (EpAnn(EpAnn))
-import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax))
+import GHC.Parser.Annotation (noSrcSpanA, EpAnnComments (EpaComments), NoAnn (noAnn), EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax), emptyComments, TrailingAnn (AddSemiAnn), SrcSpanAnnA)
 import Data.List.NonEmpty.Extra (singleton)
-import Development.IDE.GHC.Compat.Core (GrhsAnn(..))
+import Development.IDE.GHC.Compat.Core (GrhsAnn(..), AnnListItem (AnnListItem), HasSrcSpan, srcSpanStart, EpAnnHsCase (..))
+import Data.List.Extra (allSame)
 
 inRange :: SrcSpan -> Range -> Bool
 inRange s range = maybe False (`isSubrangeOf` range) (srcSpanToRange s)
@@ -114,7 +115,7 @@ suggestCaseSplitProvider
             -- It might important to check the case of two nested `case`
             -- expressions, both with non-exhaustive patterns.
             -> do
-      let pmAltsConApp = dsMsgToPmAlts dsmsg
+      let pmAltsConApp = dsMsgToPmAlts dsmsg -- TODO: convert to NonEmpty
 
       (old, new) <- handleMaybeM (PluginInternalError "Unable to makeEditText")
           $ liftIO $ runMaybeT
@@ -217,38 +218,39 @@ makeEditText pm missingPs range = do
                 Nothing -> node
                 Just HRefl -> case node of
                   h@(HsCase x e existingPs) | getHasLoc e `inRange` range
-                     -> let (braced, alts) = case mg_alts existingPs of
-                                  (L (EpAnn _ (AnnList _ (ListBraces _ _) _ _ _) _) ls) -> (True, ls)
-                                  (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
-                                  _ -> error "Ooops"
-                            indent = case alts of
-                                  (l:_) -> srcSpanStartCol $ realSrcSpan $ getLoc $ l
-                                  _ -> trace "underscore" $ case hsCaseAnnCase x of
-                                          EpTok (EpaSpan l) -> srcSpanStartCol (realSrcSpan $ getLoc $ l) + defaultIndent
-                                          _ -> error "Missing `case` keyword???"
-                        in trace ("I should change this `case`! It's got these patterns already = "
-                               ++ show (exactPrint existingPs)
-                               ++ " but I should add the missing ones coming from the diagnostics"
-                               ++ showAst h
-                               ++ '\n':"")
-                      $ HsCase x e $ addMissingPatterns missingPs existingPs
-
-                  HsCase _ _ _ -> trace "Leave this `case`"
-                                $ node
-
+                    -> let (braced, alts) = case mg_alts existingPs of
+                                 (L (EpAnn _ (AnnList _ (ListBraces _{- here's the indentation of the { -} _) _ _ _) _) ls) -> (True, ls)
+                                 (L (EpAnn _ (AnnList _ ListNone _ _ _) _) ls) -> (False, ls)
+                                 _ -> error "Ooops"
+                           onelined = allSame $ map getStartCol alts
+                           indent = case alts of
+                                 (l:_) -> getStartCol l
+                                 _ -> case hsCaseAnnCase x of
+                                         EpTok (EpaSpan l) -> getStartCol l + defaultIndent - 1 -- TODO: understand why -1
+                                         _ -> error "Missing `case` keyword???"
+                       in trace (showAst h) $
+                       HsCase x e $ addMissingPatterns indent missingPs existingPs
                   _ -> node
-      defaultIndent = 2
 
-addMissingPatterns :: MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
-addMissingPatterns missing mg@(MG { mg_alts = mg_alts@(L l (a:as)) })
-  = let methodEpAnn = noAnnSrcSpanDP
-                    $ deltaPos 1
-                    $ (srcSpanStartCol (realSrcSpan $ getLoc a)
-                     - srcSpanStartCol (realSrcSpan $ getLoc mg_alts))
-        newLine (L _ e) = L methodEpAnn e
-    in mg { mg_alts = L l (a:as ++ map (newLine . makeMatch) missing) }
-addMissingPatterns _ mg = mg -- TODO this is the case where no exiting pattern is listed
+defaultIndent :: Int
+defaultIndent = 2
 
+getStartCol :: HasSrcSpan a => a -> Int
+getStartCol = srcSpanStartCol . realSrcSpan . getLoc
+
+newIndentedLn :: Int -> GenLocated SrcSpanAnnA e -> GenLocated SrcSpanAnnA e
+newIndentedLn indent (L _ e) = L l e
+  where l = EpAnn (EpaDelta noSrcSpanA (deltaPos 1 indent) [])
+                  (AnnListItem [])
+                  emptyComments
+
+addMissingPatterns :: Int -> MissingPatterns -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+addMissingPatterns indent missing mg@(MG { mg_alts = L l [] })
+  = mg { mg_alts = L l       (zipWith ($) (newIndentedLn indent:repeat (newIndentedLn 0)) (makeMatch <$> missing)) }
+addMissingPatterns _ missing mg@(MG { mg_alts = L l as })
+  = let indent = getStartCol (getLoc l) in
+    mg { mg_alts = L l (as ++ zipWith ($) (newIndentedLn 0:repeat (newIndentedLn 0)) (makeMatch <$> missing)) }
+    -- TODO: In the braced case, `a` should be added semicolon if it doesn't have it yet
 
 makeMatch :: PmAltConApp -> LMatch GhcPs (LHsExpr GhcPs)
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
@@ -260,13 +262,13 @@ makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
                                                 , pat_con = L noSrcSpanA $ nameRdrName $ getName ctor
                                                 , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
                                                 }]
-                , m_grhss = GRHSs (EpaComments [])
+                , m_grhss = GRHSs emptyComments
                                   -- TODO: remember to respect unicode arrow of preceeding cases or the -XUnicodeSyntax (https://downloads.haskell.org/ghc/latest/docs/users_guide/exts/unicode_syntax.html#extension-UnicodeSyntax)
                                   -- TODO: check whether ga_sep default choice is really not printing anything.
                                   (singleton $ L noSrcSpanA $ GRHS (EpAnn noSrcSpanA
                                                                           (GrhsAnn{ ga_vbar = Nothing
                                                                                   , ga_sep = Right (EpUniTok d1 NormalSyntax) })
-                                                                          (EpaComments [])) []
+                                                                          emptyComments) []
                                                             $ L noSrcSpanA $ HsHole $ HoleVar $ L noAnnSrcSpanDP1
                                              $ unnamedHoleRdrName)
                                   (EmptyLocalBinds NoExtField)
