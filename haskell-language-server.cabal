@@ -2040,6 +2040,7 @@ test-suite func-test
                     , warnings
                     , pedantic
                     , refactor
+  buildable: False
   type:               exitcode-stdio-1.0
   build-tool-depends:
     haskell-language-server:haskell-language-server,
@@ -2089,6 +2090,7 @@ test-suite wrapper-test
   import:             defaults
                     , warnings
                     , pedantic
+  buildable: False
   type:               exitcode-stdio-1.0
   build-tool-depends:
     haskell-language-server:haskell-language-server-wrapper,
@@ -2104,6 +2106,7 @@ test-suite wrapper-test
 
 benchmark benchmark
     import:           defaults, warnings
+    buildable: False
     -- Depends on shake-bench which is unbuildable after this point
     type: exitcode-stdio-1.0
     ghc-options: -threaded
@@ -2149,6 +2152,7 @@ executable ghcide-test-preprocessor
 
 test-suite ghcide-tests
   import: warnings, defaults
+  buildable: False
   type:               exitcode-stdio-1.0
   default-language:   GHC2021
   build-tool-depends:
@@ -2320,6 +2324,7 @@ library ghcide-bench-lib
 
 test-suite ghcide-bench-test
     import: defaults
+    buildable: False
     type: exitcode-stdio-1.0
     build-tool-depends:
         ghcide:ghcide,

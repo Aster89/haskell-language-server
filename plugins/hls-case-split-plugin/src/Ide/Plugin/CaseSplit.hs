@@ -15,7 +15,6 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
-import qualified Data.Map                                 as M
 import qualified Data.Text                                as T
 import           Development.IDE                          hiding (line)
 import           Development.IDE.Core.PluginUtils
@@ -25,7 +24,7 @@ import qualified Language.LSP.Protocol.Message            as LSP
 import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
 import qualified Development.IDE.Core.Shake               as Shake
 import Language.LSP.Protocol.Types
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), Outputable (ppr), showSDocUnsafe, ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar))
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar))
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Data.Maybe (mapMaybe, fromMaybe)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
@@ -37,7 +36,7 @@ import Development.IDE.GHC.Compat (getLoc)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Maybe
 import Development.IDE.GHC.Compat.ExactPrint
-import Data.Data (Data(), gmapQ)
+import Data.Data (Data())
 import Data.Generics.Schemes (everywhere)
 import Debug.Trace
 import Type.Reflection (eqTypeRep,
@@ -45,7 +44,6 @@ import Type.Reflection (eqTypeRep,
                         typeRep, typeOf)
 import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName)
 import GHC.Types.SrcLoc (SrcSpan, GenLocated (L), EpaLocation' (EpaDelta))
-import Control.Monad (MonadPlus(mplus, mzero))
 import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Control.Monad.Trans (lift)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
@@ -80,9 +78,6 @@ descriptor _ plId = (defaultPluginDescriptor plId "Provides a code action to spl
   , pluginModifyDynflags = mempty { dynFlagsModifyGlobal = \dynFlags -> dynFlags { maxUncoveredPatterns = 30 } }
   }
 
-astTraversalWith :: forall b r m. (MonadPlus m, Data b) => b -> (forall a. Data a => a -> m r) -> m r
-astTraversalWith ast f = foldl mplus mzero $ flip gmapQ ast $ \y -> f y `mplus` astTraversalWith y f
-
 suggestCaseSplitProvider :: PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
 suggestCaseSplitProvider
   state
@@ -109,13 +104,13 @@ suggestCaseSplitProvider
                                           Just fileDiags -> fileDiags
 
   case mapMaybe (\d -> fdStructuredMessage d ^? _SomeStructuredMessage
-                                               . msgEnvelopeErrorL
-                                               . _DsMessage) diags of
-    [dsmsg] -- TODO: I need to filter for the diagnostic I want.
+                                              . msgEnvelopeErrorL
+                                              . _DsMessage) diags of
+    (mapMaybe dsMsgToPmAlts -> [pmAltsConApp])
+            -- TODO: I need to filter for the diagnostic I want.
             -- It might important to check the case of two nested `case`
             -- expressions, both with non-exhaustive patterns.
             -> do
-      let pmAltsConApp = dsMsgToPmAlts dsmsg -- TODO: convert to NonEmpty
 
       (old, new) <- handleMaybeM (PluginInternalError "Unable to makeEditText")
           $ liftIO $ runMaybeT
@@ -138,39 +133,18 @@ suggestCaseSplitProvider
     _ -> error "Oops, unexpected number of messages!"
 
   where
-    pmAltsToWorkspaceEdit :: [PmAltConApp] -> WorkspaceEdit
-    pmAltsToWorkspaceEdit = stringsToWorkspaceEdit . fmap pmAltToString
 
-    stringsToWorkspaceEdit :: [String] -> WorkspaceEdit
-    stringsToWorkspaceEdit = edit . T.pack . unlines
-
-    pmAltToString :: PmAltConApp -> String
-    pmAltToString pmalt = unwords
-                        $ showPpr (paca_con pmalt):(const "_" <$> paca_ids pmalt)
-
-    dsMsgToPmAlts :: DsMessage -> [PmAltConApp]
+    dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
     dsMsgToPmAlts =
       \case DsNonExhaustivePatterns !CaseAlt _ _ ![ids] !nablas ->
-                nablas <&>
+                Just $ nablas <&>
                   (\nabla -> let facts = ts_facts $ nabla_tm_st nabla
                              in case vi_pos <$> lookupUSDFM facts ids of
                                    Just [x] -> x
-                                   _ -> error "Oops")
-            _ -> error "Oops, DsMessage of unexpected shape!"
+                                   Just _ -> error "Oops 1"
+                                   _ -> error "Oops 2")
+            _ -> Nothing
 
-
-    textEdit msg = let pragmaInsertRange = let p = _end range in Range p p
-                       extract = T.init
-                               . T.unlines
-                               . map (("            " `T.append`) . (`T.append` " -> _"))
-                               . T.lines
-                   in TextEdit pragmaInsertRange $ "\n" `T.append` extract msg
-    edit msg =
-      WorkspaceEdit {
-        _changes = Just $ M.singleton (_textDocument ^. L.uri) $ [textEdit msg]
-      , _documentChanges = Nothing
-      , _changeAnnotations = Nothing
-      }
 
 suggestCaseSplitProvider _ _ _ = pure $ InL []
 
@@ -178,9 +152,6 @@ _DsMessage :: Fold GhcMessage DsMessage
 _DsMessage = prism' GhcDsMessage $ \case
   GhcDsMessage dsmsg -> Just dsmsg
   _ -> Nothing
-
-showPpr ::  Outputable a => a -> String
-showPpr = showSDocUnsafe . ppr
 
 makeEditText :: Monad m => ParsedModule -> MissingPatterns -> Range -> MaybeT m (T.Text, T.Text)
 makeEditText pm missingPs range = do
