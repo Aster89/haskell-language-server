@@ -4,6 +4,7 @@
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
+{-# LANGUAGE MultiWayIf        #-}
 
 module Ide.Plugin.CaseSplit
   ( descriptor
@@ -11,25 +12,23 @@ module Ide.Plugin.CaseSplit
   ) where
 
 -- TODO: Improve import list: decide where to drop explict list.
-import Control.Arrow ((&&&))
+import Control.Arrow ((&&&), second)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
-import Control.Monad (MonadPlus)
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Reader (runReader, ReaderT (runReaderT), MonadReader (ask), asks)
 import Control.Monad.State.Strict (MonadState (get, put), evalStateT)
 import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Maybe (runMaybeT)
 import Data.Bifunctor (bimap)
 import Data.Data (Data())
 import Data.Function (on, (&))
 import Data.Generics.Schemes (everywhereM)
 import Data.List (groupBy)
 import Data.List.Extra (chunksOf)
-import Data.Maybe (mapMaybe, fromJust)
+import Data.Maybe (fromJust, isJust)
 import Development.IDE (Pretty (pretty), Recorder, WithPriority, IdeState (shakeExtras), FileDiagnostic (fdStructuredMessage), runAction, GetParsedModule (GetParsedModule), srcSpanToRange, HscEnvEq (hscEnv), GhcSessionDeps (GhcSessionDeps))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import Development.IDE.Core.PluginUtils (runActionE, useE, activeDiagnosticsInRange)
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), HscEnv (hsc_dflags))
+import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), HscEnv (hsc_dflags), Id)
 import Development.IDE.GHC.Compat (getLoc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Development.IDE.GHC.Compat.ExactPrint (exactPrint, d0, d1, noAnnSrcSpanDP1, setEntryDP)
@@ -44,7 +43,7 @@ import GHC.Types.Name.Reader (nameRdrName)
 import GHC.Types.SrcLoc (SrcSpan(RealSrcSpan), GenLocated (L), combineSrcSpans)
 import GHC.Types.Unique.SDFM (lookupUSDFM)
 import Ide.Logger ((<+>))
-import Ide.Plugin.Error (PluginError(PluginInternalError), getNormalizedFilePathE, handleMaybeM)
+import Ide.Plugin.Error (getNormalizedFilePathE)
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Ide.Types (defaultPluginDescriptor, mkPluginHandler, pluginGetClientCapabilities, PluginDescriptor(pluginHandlers, pluginPriority), PluginId, PluginMethodHandler)
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
@@ -93,7 +92,9 @@ suggestCaseSplitProvider
 
   (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
 
-  let isUnicodeSyntax = On Ext.UnicodeSyntax `elem` extensions dynFlags
+  let arrowSyntax = if On Ext.UnicodeSyntax `elem` extensions dynFlags
+                      then UnicodeSyntax
+                      else NormalSyntax
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
@@ -104,8 +105,10 @@ suggestCaseSplitProvider
   case fileDiags
        -- pair each file diag with its ds messages, if any
      & fmap (id &&& getMaybeDsMsg)
-       -- discard those without ds messages
-     & mapMaybe sequence of
+       -- discard those with `Nothing` ds messages
+     & filter (isJust . snd)
+       -- unwrap the surviving `Just`s
+     & fmap (second fromJust) of
         -- if none left, return no action
         [] -> pure $ InL []
         -- if some left
@@ -120,14 +123,10 @@ suggestCaseSplitProvider
                   & bimap fdLspDiagnostic dsMsgToPmAlts
                   of
 
-          (_, Nothing) -> error "This should not be possible."
-          (_, Just []) -> pure $ InL [] -- This happens when the type of the expression is unknown
-          (diag, Just pmAltsConApp) -> do
+          (_, []) -> pure $ InL [] -- This happens when the type of the expression is unknown
+          (diag, pmAltsConApp) -> do
 
-            (old, new) <- handleMaybeM (PluginInternalError "Unable to makeEditText")
-                $ liftIO
-                $ runMaybeT
-                $ makeEditText pm pmAltsConApp _range `runReaderT` isUnicodeSyntax
+            (old, new) <- liftIO $ makeEditText pm pmAltsConApp _range arrowSyntax
 
             caps <- lift pluginGetClientCapabilities
 
@@ -135,7 +134,7 @@ suggestCaseSplitProvider
               $ CodeAction { _title       = "Add placeholders for all missing patterns"
                            , _kind        = Just CodeActionKind_QuickFix
                            , _diagnostics = Just [diag]
-                           , _isPreferred = Nothing -- TODO: Just True?
+                           , _isPreferred = Nothing
                            , _disabled    = Nothing
                            , _edit        = Just $ diffText caps (verTxtDocId, old) new IncludeDeletions
                            , _command     = Nothing
@@ -146,17 +145,22 @@ suggestCaseSplitProvider
     getMaybeDsMsg :: FileDiagnostic -> Maybe DsMessage
     getMaybeDsMsg d = fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage
 
-    dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
+    dsMsgToPmAlts :: DsMessage -> [PmAltConApp]
     dsMsgToPmAlts =
-      \case DsNonExhaustivePatterns !CaseAlt _ _ ![ids] !nablas ->
-                Just $ nablas >>=
-                  (\nabla -> let facts = ts_facts $ nabla_tm_st nabla
-                             in case vi_pos <$> lookupUSDFM facts ids of
-                                   Just [x] -> [x]
-                                   Just [] -> []
-                                   _ -> error "This should not be possible.")
-            DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> Just [] -- TODO: implement this
+      \case DsNonExhaustivePatterns !CaseAlt _ _ ![identifier] !nablas -> nablasToPmAlts identifier nablas
+            DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> [] -- TODO: implement this
             _ -> error "This should not be possible."
+
+nablasToPmAlts :: Id -> [Nabla] -> [PmAltConApp]
+nablasToPmAlts identifier nablas
+  = nablas >>= nabla_tm_st
+           .> ts_facts
+           .> flip lookupUSDFM identifier
+           .> fmap vi_pos
+           .> (\case Just x -> x
+                     _ -> error "This should not be possible.")
+  where
+    (.>) = flip (.)
 
 -- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
 -- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
@@ -172,60 +176,84 @@ _DsMessage = prism' GhcDsMessage $ \case
   GhcDsMessage dsmsg -> Just dsmsg
   _ -> Nothing
 
-makeEditText :: (MonadPlus m, MonadReader Bool m) => ParsedModule -> MissingPatterns -> Range -> m (Text, Text)
-makeEditText pm missingPs range = do
+-- | Given a `ParsedModule` this function uses `exactPrint` to produce the
+-- `Text`s of said module before and after the `MissingPatterns` are appended
+-- to the existing ones in the innermost `case` expression enclosing the
+-- `Range` of the cursor, using the arrow style passed as the last
+-- `IsUnicodeSyntax` argument.
+makeEditText :: ParsedModule -> MissingPatterns -> Range -> IsUnicodeSyntax -> IO (Text, Text)
+makeEditText pm missingPs cursor arrowSyntax = do
 
-  isUnicodeSyntax <- ask
   let ps = pm_parsed_source pm
       old = T.pack $ exactPrint ps
       ps' = everywhereM go ps -- We transform the `ParsedSource` bottom-up
             `evalStateT` False -- and we pass a `Bool` through `State` to update only one node.
-            `runReader` isUnicodeSyntax
+            `runReader` arrowSyntax
       new = T.pack $ exactPrint ps'
 
   pure (old, new)
 
     where
-      go :: forall d m. (MonadState Bool m, MonadReader Bool m, Data d) => d -> m d
+      go :: forall d m. (MonadState Bool m, MonadReader IsUnicodeSyntax m, Data d) => d -> m d
       go node = do
           found <- get
-          if found
-            then pure node
-            else case typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs) of
-                    Nothing -> pure node
-                    Just HRefl -> case node of
-                      HsCase x@(EpAnnHsCase (EpTok (getHasLoc -> caseSSpan)) (EpTok (getHasLoc -> ofSSpan)))
-                             e
-                             existingPs@(MG _ (L (EpAnn (getHasLoc -> endSSpan) _ _) _))
-                        | range `inSpan`  caseExprSpan caseSSpan ofSSpan endSSpan
-                        -> do put True
-                              missingPs' <- traverse makeMatch missingPs
-                              pure $ HsCase x e $ addMissingPatterns missingPs' existingPs
-                      _ -> pure node
+          if | not found
+             -- ^ Proceed only if we haven't found & edited the node yet,
+             , Just HRefl <- typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs)
+             -- ^ only inspect nodes of the appropriate type,
+             , HsCase extCase scrut existingPs <- node
+             -- ^ only inspect `case` expressions (and deconstruct the bits),
+             , (EpAnnHsCase (EpTok caseTok) (EpTok ofTok)) <- extCase
+             -- ^ extract `case` and `of` tokens,
+             , (MG _ (L (EpAnn endTok _ _) _)) <- existingPs
+             -- ^ extract the end-of-case-expression "token",
+             , let caseSSpan = getHasLoc caseTok
+                   ofSSpan = getHasLoc ofTok
+                   endSSpan = getHasLoc endTok
+             -- ^ get the location for the three tokens,
+             , cursor `inSpan`  caseExprSpan caseSSpan ofSSpan endSSpan
+             -- ^ make sure the cursor is somewhere in this `case` expression,
+               -> do put True
+                     -- ^ take note we've found the node,
+                     missingPs' <- traverse makeMatch missingPs
+                     -- ^ make a match out of each missing pattern,
+                     pure $ HsCase extCase scrut $ appendMissingPats existingPs missingPs'
+                     -- ^ and append missing patterns to existing ones.
+             | otherwise -> pure node
+             -- ^ Anything else, leave the node unchanged.
 
+-- | Given the `SrcSpan` of the `case` token, the `of` token, and the end of
+-- the alternatives, this function combines them to return a `SrcSpan` that goes
+-- from the `case` token to the end of the whole `case` expression.
 caseExprSpan :: SrcSpan -> SrcSpan -> SrcSpan -> SrcSpan
 caseExprSpan caseSSpan _ endSSpan@(RealSrcSpan _ _) = combineSrcSpans caseSSpan endSSpan
 caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 
+-- | Predicate telling the given `Range` falls within the given `SrcSpan`.
 inSpan :: Range -> SrcSpan -> Bool
 inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
+-- | Predicate telling if two located annotations are (actually, start) on the
+-- same line.
 isOnelined :: LocatedAn ann e -> LocatedAn ann e -> Bool
 isOnelined = (==) `on` getStartLine
 
+-- | Predicate telling whether an
 isBraced :: EpAnn (AnnList a) -> Bool
 isBraced (EpAnn _ (AnnList _ (ListBraces (EpTok (EpaSpan _)) _) _ _ _) _) = True
-isBraced (EpAnn _ (AnnList _ ListNone                           _ _ _) _) = False
-isBraced _ = error "Ooops"
+isBraced _ = False
 
+-- | Get the starting column of an `HasSrcSpan`.
 getStartCol :: HasSrcSpan a => a -> Int
 getStartCol = srcSpanStartCol . realSrcSpan . getLoc
 
+-- | Get the starting line of an `HasSrcSpan`.
 getStartLine :: HasSrcSpan a => a -> Int
 getStartLine = srcSpanStartLine . realSrcSpan . getLoc
 
+-- | Set the DeltaPos for the given annotation.
 setDP :: Int -> Int -> LocatedAn t a -> LocatedAn t a
-setDP = (flip setEntryDP .) . deltaPos
+setDP deltaLine deltaColumn lann = setEntryDP lann $ deltaPos deltaLine deltaColumn
 
 -- | Add semicolon, unless one is already present.
 addSemiCol :: LocatedAn AnnListItem a -> LocatedAn AnnListItem a
@@ -234,24 +262,40 @@ addSemiCol (L l@(EpAnn _ ls _) e)
   = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
 addSemiCol l = l
 
-addMissingPatterns :: [LMatch GhcPs (LHsExpr GhcPs)] -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+-- | Given a `MatchGroup` and a list of `LMatch`s, this function inserts the
+-- latter matches in the former group, trying to honor the existing layout.
+--
+-- When no existing matches are present yet, we insert the missing ones one per
+-- line, adding semicolons if the alternatives are braced.
+--
+-- When some matches are already present, we write as many missing matches per
+-- line as there are in the last line of the pre-existing ones (see
+-- `TSomePatternsOnOneLineNoBraces.hs` and
+-- `TSomePatternsOnOneLineNoBraces.expected.hs`).
+appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> [LMatch GhcPs (LHsExpr GhcPs)] -> MatchGroup GhcPs (LHsExpr GhcPs)
 -- no matches present yet
-addMissingPatterns missing mg@(MG { mg_alts = L l [] })
+appendMissingPats mg@(MG { mg_alts = L l [] }) missing
   = mg { mg_alts = L l (fmt missing) }
     where
       fmt = if isBraced l
               then zipWith3 (.)
-                            (replicate (length missing - 1) addSemiCol ++ [id])
                             (repeat $ setDP 1 defaultIndent)
+                            (replicate (length missing - 1) addSemiCol ++ [id])
               else zipWith ($)
                            (setDP 1 defaultIndent:repeat (setDP 1 0))
 
+      -- | Default indentation, with respect to the current layout context, to
+      -- use when there's no matches present yet.
+      defaultIndent :: Int
+      defaultIndent = 2
+
+
 -- there are already existing patterns - add the ones that are missing
-addMissingPatterns missing mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings })
-  = case ann of
-      (fmap (getStartCol . getHasLoc) . al_anchor &&& al_brackets -> (Just anchor, brackets))
+appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) missing
+  = if | let brackets = al_brackets ann
+       , Just anchor <- getStartCol . getHasLoc <$> al_anchor ann
         -> mg { mg_alts = L altsLoc (alts anchor brackets) }
-      _ -> error "This should not be possible"
+       | otherwise -> error "This should not be possible"
   where
     alts anchor brackets
          = let -- groups of patterns on the same line
@@ -286,10 +330,9 @@ isSemiCol :: TrailingAnn -> Bool
 isSemiCol (AddSemiAnn _) = True
 isSemiCol _ = False
 
-makeMatch :: MonadReader Bool m => PmAltConApp -> m (LMatch GhcPs (LHsExpr GhcPs))
+makeMatch :: MonadReader IsUnicodeSyntax m => PmAltConApp -> m (LMatch GhcPs (LHsExpr GhcPs))
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
-        = do arrow <- asks $ \case True -> UnicodeSyntax
-                                   False -> NormalSyntax
+        = do arrow <- ask
              pure $ L noSrcSpanA
               $ Match { m_ext = NoExtField
                       , m_ctxt = CaseAlt
@@ -310,9 +353,6 @@ makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
 makeMatch _ = error "boom"
 
 type MissingPatterns = [PmAltConApp]
-
-defaultIndent :: Int
-defaultIndent = 2
 
 none :: Foldable t => (a -> Bool) -> t a -> Bool
 none p xs = not $ any p xs
