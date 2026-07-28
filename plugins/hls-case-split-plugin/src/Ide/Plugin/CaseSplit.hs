@@ -185,6 +185,8 @@ _DsMessage = prism' GhcDsMessage $ \case
   GhcDsMessage dsmsg -> Just dsmsg
   _ -> Nothing
 
+type MissingPatterns = NE.NonEmpty PmAltConApp
+
 -- | Given a `ParsedModule` this function uses `exactPrint` to produce the
 -- `Text`s of said module before and after the `MissingPatterns` are appended
 -- to the existing ones in the innermost `case` expression enclosing the
@@ -242,35 +244,6 @@ caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 inSpan :: Range -> SrcSpan -> Bool
 inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
--- | Predicate telling if two located annotations are (actually, start) on the
--- same line.
-isOnelined :: LocatedAn ann e -> LocatedAn ann e -> Bool
-isOnelined = (==) `on` getStartLine
-
--- | Predicate telling whether an
-isBraced :: EpAnn (AnnList a) -> Bool
-isBraced (EpAnn _ (AnnList _ (ListBraces (EpTok (EpaSpan _)) _) _ _ _) _) = True
-isBraced _ = False
-
--- | Get the starting column of an `HasSrcSpan`.
-getStartCol :: HasSrcSpan a => a -> Int
-getStartCol = srcSpanStartCol . realSrcSpan . getLoc
-
--- | Get the starting line of an `HasSrcSpan`.
-getStartLine :: HasSrcSpan a => a -> Int
-getStartLine = srcSpanStartLine . realSrcSpan . getLoc
-
--- | Set the DeltaPos for the given annotation.
-setDP :: Int -> Int -> LocatedAn t a -> LocatedAn t a
-setDP deltaLine deltaColumn lann = setEntryDP lann $ deltaPos deltaLine deltaColumn
-
--- | Add semicolon, unless one is already present.
-addSemiCol :: LocatedAn AnnListItem a -> LocatedAn AnnListItem a
-addSemiCol (L l@(EpAnn _ ls _) e)
-  | none isSemiCol (lann_trailing ls)
-  = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
-addSemiCol l = l
-
 -- | Given a `MatchGroup` and a list of `LMatch`s, this function inserts the
 -- latter matches in the former group, trying to honor the existing layout.
 --
@@ -286,9 +259,10 @@ appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> NE.NonEmpty (LMatch Ghc
 appendMissingPats mg@(MG { mg_alts = L l [] }) missing
   = mg { mg_alts = L l (NE.toList $ NE.zipWith ($) (fmt $ isBraced l) missing) }
     where
-      fmt True = NE.map (setDP 1 defaultIndent .)
-               $ replicate (length missing - 1) addSemiCol |: id
-      fmt False = setDP 1 defaultIndent :| repeat (setDP 1 0)
+      -- TODO: explain more in detail
+      fmt NotBraced = setDP 1 defaultIndent :| repeat (setDP 1 0)
+      fmt Braced = NE.map (setDP 1 defaultIndent .)
+                 $ replicate (length missing - 1) addSemiCol |: id
 
       -- | Default indentation, with respect to the current layout context, to
       -- use when there's no matches present yet.
@@ -303,6 +277,7 @@ appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) miss
         -> mg { mg_alts = L altsLoc (NE.toList $ alts anchor brackets) }
        | otherwise -> error "This should not be possible"
   where
+    -- TODO: explain more in detail
     alts anchor brackets
          = let -- groups of patterns on the same line
                ptrnGrps = groupBy isOnelined existings
@@ -316,32 +291,14 @@ appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) miss
                                                              (replicate (length ms) addSemiCol |: id)
                                                              (setDP 1 indent m :| map (setDP 0 1) ms)
                (indent, addSemiCols)
-                 = if isBraced altsLoc
-                       then (anchor - case brackets of
+                 = case isBraced altsLoc of
+                       Braced -> (anchor - case brackets of
                                      ListBraces (EpTok (getStartCol . getHasLoc -> col)) _ -> col
                                      _ -> error "this is impossible"
-                            ,NE.zipWith ($) (replicate (nGrps - 1) id <> replicate (length missingGrps) (mapLast addSemiCol) |: id))
-                       else (0, id)
+                                 ,NE.zipWith ($) (replicate (nGrps - 1) id <> replicate (length missingGrps) (mapLast addSemiCol) |: id))
+                       NotBraced -> (0, id)
 
            in sconcat $ addSemiCols $ NE.fromList (map NE.fromList ptrnGrps) <> missingGrps
-
--- | Version of `Data.List.Extra.chunksOf` (**not** to be confused with
--- `Data.List.Split.chunksOf`) for a `NonEmpty` lists.
-chunksOf1 :: Int -> NE.NonEmpty a -> NE.NonEmpty (NE.NonEmpty a)
-chunksOf1 n xs
-  | n >= 1
-  , (b:before, after) <- NE.splitAt n xs
-    = (b :| before) :| case after of
-                         [] -> []
-                         _ -> map NE.fromList $ chunksOf n after
-  | otherwise = error "chunksOf1: the `Int` argument should be ≥ 1"
-
--- | Maps a funciton f over the last element of a `NonEmpty` list.
-mapLast :: (a -> a) -> NE.NonEmpty a -> NE.NonEmpty a
-mapLast f (a :| []) = f a :| []
-mapLast f (a :| as) = a :| mapLast' f as
-  where
-    mapLast' f as = init as ++ [f $ last as]
 
 isSemiCol :: TrailingAnn -> Bool
 isSemiCol (AddSemiAnn _) = True
@@ -370,7 +327,56 @@ makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor)
                       }
 makeMatch _ = error "boom"
 
-type MissingPatterns = NE.NonEmpty PmAltConApp
+-- | Predicate telling if two located annotations are (actually, start) on the
+-- same line.
+isOnelined :: LocatedAn ann e -> LocatedAn ann e -> Bool
+isOnelined = (==) `on` getStartLine
 
+data Braced = Braced | NotBraced
+-- | Predicate telling whether an `EpAnn (AnnList a)` has braces or not.
+-- Returns an ad-hoc type isomorphic to `Bool` to make pattern matching
+-- more readable.
+isBraced :: EpAnn (AnnList a) -> Braced
+isBraced (EpAnn _ (AnnList _ (ListBraces (EpTok (EpaSpan _)) _) _ _ _) _) = Braced
+isBraced _ = NotBraced
+
+-- | Get the starting column of an `HasSrcSpan`.
+getStartCol :: HasSrcSpan a => a -> Int
+getStartCol = srcSpanStartCol . realSrcSpan . getLoc
+
+-- | Get the starting line of an `HasSrcSpan`.
+getStartLine :: HasSrcSpan a => a -> Int
+getStartLine = srcSpanStartLine . realSrcSpan . getLoc
+
+-- | Set the DeltaPos for the given annotation.
+setDP :: Int -> Int -> LocatedAn t a -> LocatedAn t a
+setDP deltaLine deltaColumn lann = setEntryDP lann $ deltaPos deltaLine deltaColumn
+
+-- | Add semicolon, unless one is already present.
+addSemiCol :: LocatedAn AnnListItem a -> LocatedAn AnnListItem a
+addSemiCol (L l@(EpAnn _ ls _) e)
+  | none isSemiCol (lann_trailing ls)
+  = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
+addSemiCol l = l
+
+-- | Version of `Data.List.Extra.chunksOf` (**not** to be confused with
+-- `Data.List.Split.chunksOf`) for a `NonEmpty` lists.
+chunksOf1 :: Int -> NE.NonEmpty a -> NE.NonEmpty (NE.NonEmpty a)
+chunksOf1 n xs
+  | n >= 1
+  , (b:before, after) <- NE.splitAt n xs
+    = (b :| before) :| case after of
+                         [] -> []
+                         _ -> map NE.fromList $ chunksOf n after
+  | otherwise = error "chunksOf1: the `Int` argument should be ≥ 1"
+
+-- | Maps a funciton f over the last element of a `NonEmpty` list.
+mapLast :: (a -> a) -> NE.NonEmpty a -> NE.NonEmpty a
+mapLast f (a :| []) = f a :| []
+mapLast f (a :| as) = a :| mapLast' f as
+  where
+    mapLast' f as = init as ++ [f $ last as]
+
+-- | Convenient negation of `any`.
 none :: Foldable t => (a -> Bool) -> t a -> Bool
 none p xs = not $ any p xs
