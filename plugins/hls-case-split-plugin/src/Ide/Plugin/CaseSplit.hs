@@ -5,24 +5,24 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE MultiWayIf        #-}
+{-# LANGUAGE OrPatterns #-}
 
 module Ide.Plugin.CaseSplit
   ( descriptor
   , Log
   ) where
 
--- TODO: Improve import list: decide where to drop explict list.
 import Control.Arrow ((&&&), second)
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
 import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.Reader (runReader, ReaderT (runReaderT), MonadReader (ask), asks)
+import Control.Monad.Reader (runReader, MonadReader (ask))
 import Control.Monad.State.Strict (MonadState (get, put), evalStateT)
 import Control.Monad.Trans (lift)
 import Data.Bifunctor (bimap)
 import Data.Data (Data())
 import Data.Function (on, (&))
 import Data.Generics.Schemes (everywhereM)
-import Data.List (groupBy)
+import Data.List (groupBy, minimumBy)
 import Data.List.Extra (chunksOf)
 import Data.Maybe (fromJust, isJust)
 import Development.IDE (Pretty (pretty), Recorder, WithPriority, IdeState (shakeExtras), FileDiagnostic (fdStructuredMessage), runAction, GetParsedModule (GetParsedModule), srcSpanToRange, HscEnvEq (hscEnv), GhcSessionDeps (GhcSessionDeps))
@@ -33,7 +33,7 @@ import Development.IDE.GHC.Compat (getLoc)
 import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
 import Development.IDE.GHC.Compat.ExactPrint (exactPrint, d0, d1, noAnnSrcSpanDP1, setEntryDP)
 import Development.IDE.Types.Diagnostics (_SomeStructuredMessage, FileDiagnostic (fdLspDiagnostic))
-import GHC (DynFlags(extensions), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces, ListNone), LMatch)
+import GHC (DynFlags(extensions), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, EpToken (EpTok), EpaLocation' (EpaSpan), AnnList (AnnList), AnnListBrackets (ListBraces), LMatch)
 import GHC (EpAnn(EpAnn))
 import GHC.Driver.DynFlags (OnOff(On))
 import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName)
@@ -43,7 +43,7 @@ import GHC.Types.Name.Reader (nameRdrName)
 import GHC.Types.SrcLoc (SrcSpan(RealSrcSpan), GenLocated (L), combineSrcSpans)
 import GHC.Types.Unique.SDFM (lookupUSDFM)
 import Ide.Logger ((<+>))
-import Ide.Plugin.Error (getNormalizedFilePathE)
+import Ide.Plugin.Error (getNormalizedFilePathE, PluginError (PluginInternalError))
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Ide.Types (defaultPluginDescriptor, mkPluginHandler, pluginGetClientCapabilities, PluginDescriptor(pluginHandlers, pluginPriority), PluginId, PluginMethodHandler)
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
@@ -60,6 +60,7 @@ import           Language.LSP.Protocol.Types (Range, CodeActionParams(CodeAction
 import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
 import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
 import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
+import Control.Monad.Trans.Except (throwE)
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -68,9 +69,9 @@ data Log where
 
 instance Pretty Log where
   pretty = \case
-    LogShake logMsg -> pretty logMsg
+    LogShake logMsg -> "LogShake " <+> pretty logMsg
     LogWAEResponseError rspErr -> "RequestWorkspaceApplyEdit Failed with " <+> pretty rspErr
-    LogResolve msg -> pretty msg
+    LogResolve msg -> "LogResolve " <+> pretty msg
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor _ plId = (defaultPluginDescriptor plId "Provides the split case code action")
@@ -83,7 +84,7 @@ suggestCaseSplitProvider
   state
   _
   CodeActionParams{ _textDocument
-                  , _range
+                  , _range = cursor
                   }
   = do
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
@@ -98,69 +99,76 @@ suggestCaseSplitProvider
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
-  (fromJust -> fileDiags) <- activeDiagnosticsInRange (shakeExtras state) nfp _range
+  fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  -- TODO: I don't like this stair-casing, but if I don't, then I have to invent a few names.
-  -- Any better approach?
-  case fileDiags
-       -- pair each file diag with its ds messages, if any
-     & fmap (id &&& getMaybeDsMsg)
-       -- discard those with `Nothing` ds messages
-     & filter (isJust . snd)
-       -- unwrap the surviving `Just`s
-     & fmap (second fromJust) of
-        -- if none left, return no action
-        [] -> pure $ InL []
-        -- if some left
-        fileDiagAndDsMsg
+  fileDiagAndDsMsg
+    <- if | (Nothing; Just []) <- fileDiags
+             -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
+          | Just fileDiags@(_:_) <- fileDiags
+             -> fileDiags
+                -- pair each file diag with its ds messages, if any
+                & fmap (id &&& getMaybeDsMsg)
+                -- discard those with `Nothing` ds messages
+                & filter (isJust . snd)
+                -- unwrap the surviving `Just`s
+                & fmap (second fromJust)
+                -- wrap back in the monad
+                & pure
 
-            -> case fileDiagAndDsMsg
-                  -- assume at least one entry
-                  & NE.fromList
-                  -- obtain the innermost
-                  & NE.minimumBy1 (ordSubrange `on` Diag._range . fdLspDiagnostic . fst)
-                  -- extract the `Diagnostic` and the pattern-match constructos
-                  & bimap fdLspDiagnostic dsMsgToPmAlts
-                  of
+  (diag, pmAltsConApps) <-
+    if | null fileDiagAndDsMsg
+          -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
+       | otherwise
+          -> fileDiagAndDsMsg
+             -- obtain the innermost
+             & minimumBy (ordSubrange `on` Diag._range . fdLspDiagnostic . fst)
+             -- extract the `Diagnostic` and the pattern-match constructos
+             & bimap fdLspDiagnostic dsMsgToPmAlts
+             & pure
 
-          (_, []) -> pure $ InL [] -- This happens when the type of the expression is unknown
-          (diag, pmAltsConApp) -> do
+  if | Nothing <- pmAltsConApps
+          -> throwE $ PluginInternalError "Error in retrieving missing patterns."
+     | Just pmAltsConApps <- pmAltsConApps
+     , not $ null pmAltsConApps -> do
 
-            (old, new) <- liftIO $ makeEditText pm pmAltsConApp _range arrowSyntax
+        (old, new) <- liftIO $ makeEditText pm pmAltsConApps cursor arrowSyntax
 
-            caps <- lift pluginGetClientCapabilities
+        caps <- lift pluginGetClientCapabilities
 
-            pure $ InL [InR
-              $ CodeAction { _title       = "Add placeholders for all missing patterns"
-                           , _kind        = Just CodeActionKind_QuickFix
-                           , _diagnostics = Just [diag]
-                           , _isPreferred = Nothing
-                           , _disabled    = Nothing
-                           , _edit        = Just $ diffText caps (verTxtDocId, old) new IncludeDeletions
-                           , _command     = Nothing
-                           , _data_       = Nothing }]
+        pure $ InL [InR
+          $ CodeAction { _title       = "Add placeholders for all missing patterns"
+                       , _kind        = Just CodeActionKind_QuickFix
+                       , _diagnostics = Just [diag]
+                       , _isPreferred = Nothing
+                       , _disabled    = Nothing
+                       , _edit        = Just $ diffText caps (verTxtDocId, old) new IncludeDeletions
+                       , _command     = Nothing
+                       , _data_       = Nothing }]
+
+     | otherwise -> pure $ InL [] -- This happens when the type of the expression is unknown.
 
   where
 
     getMaybeDsMsg :: FileDiagnostic -> Maybe DsMessage
     getMaybeDsMsg d = fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage
 
-    dsMsgToPmAlts :: DsMessage -> [PmAltConApp]
+    dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
     dsMsgToPmAlts =
       \case DsNonExhaustivePatterns !CaseAlt _ _ ![identifier] !nablas -> nablasToPmAlts identifier nablas
-            DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> [] -- TODO: implement this
-            _ -> error "This should not be possible."
+            DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> Just [] -- TODO: implement this
+            _ -> Nothing
 
-nablasToPmAlts :: Id -> [Nabla] -> [PmAltConApp]
-nablasToPmAlts identifier nablas
-  = nablas >>= nabla_tm_st
-           .> ts_facts
-           .> flip lookupUSDFM identifier
-           .> fmap vi_pos
-           .> (\case Just x -> x
-                     _ -> error "This should not be possible.")
+-- | Retrieve list of pattern match constructors
+-- for the type identified by the given `Id` -- TODO: I have to review if this means anything at all
+--
+-- Relevant information at https://simon.peytonjones.org/assets/pdfs/lower-your-guards.pdf
+nablasToPmAlts :: Id -> [Nabla] -> Maybe [PmAltConApp]
+nablasToPmAlts identifier nablas = fmap concat $ traverse go nablas
   where
-    (.>) = flip (.)
+    go = fmap vi_pos
+       . flip lookupUSDFM identifier
+       . ts_facts
+       . nabla_tm_st
 
 -- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
 -- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
@@ -305,21 +313,21 @@ appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) miss
                nLastGr = ptrnGrps
                        & last
                        & length
+               missingGrps = chunksOf nLastGr missing
+                           <&> \case [] -> error "Impossible"
+                                     (m:ms) -> zipWith ($) (replicate (length ms) addSemiCol ++ [id])
+                                                           (setDP 1 indent m:map (setDP 0 1) ms)
                (indent, addSemiCols)
                  = if isBraced altsLoc
                        then (anchor - case brackets of
                                      ListBraces (EpTok (getStartCol . getHasLoc -> col)) _ -> col
                                      _ -> error "this is impossible"
                             ,zipWith ($) (replicate (nGrps - 1) id
-                                       ++ replicate (length missingGrps) (mapLast addSemiCol)
-                                       ++ [id]))
+                                       <> replicate (length missingGrps) (mapLast addSemiCol)
+                                       <> [id]))
                        else (0, id)
-               missingGrps = chunksOf nLastGr missing
-                           <&> \case [] -> error "Impossible"
-                                     (m:ms) -> zipWith ($) (replicate (length ms) addSemiCol ++ [id])
-                                                           (setDP 1 indent m:map (setDP 0 1) ms)
 
-           in concat $ addSemiCols $ ptrnGrps ++ missingGrps
+           in concat $ addSemiCols $ ptrnGrps <> missingGrps
 
 mapLast :: (a -> a) -> [a] -> [a]
 mapLast f [a] = [f a]
@@ -331,7 +339,8 @@ isSemiCol (AddSemiAnn _) = True
 isSemiCol _ = False
 
 makeMatch :: MonadReader IsUnicodeSyntax m => PmAltConApp -> m (LMatch GhcPs (LHsExpr GhcPs))
-makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor), .. }
+makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor)
+              , paca_ids }
         = do arrow <- ask
              pure $ L noSrcSpanA
               $ Match { m_ext = NoExtField
