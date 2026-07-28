@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP               #-}
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE ViewPatterns      #-}
@@ -52,6 +51,7 @@ import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (N
 import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Type.Reflection (eqTypeRep, type (:~~:) (HRefl), typeRep, typeOf)
 import qualified Data.List.NonEmpty.Extra as NE (singleton, minimumBy1, fromList)
+import           Data.Text (Text)
 import qualified Data.Text                                as T
 import qualified Development.IDE.Core.Shake               as Shake
 import qualified Language.LSP.Protocol.Lens                   as L
@@ -62,10 +62,10 @@ import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
 import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
 import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
 
-data Log
-  = LogShake Shake.Log
-  | LogWAEResponseError (LSP.TResponseError LSP.Method_WorkspaceApplyEdit)
-  | forall a. (Pretty a) => LogResolve a
+data Log where
+  LogShake :: Shake.Log -> Log
+  LogWAEResponseError :: LSP.TResponseError LSP.Method_WorkspaceApplyEdit -> Log
+  LogResolve :: Pretty a => a -> Log
 
 instance Pretty Log where
   pretty = \case
@@ -74,7 +74,7 @@ instance Pretty Log where
     LogResolve msg -> pretty msg
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
-descriptor _ plId = (defaultPluginDescriptor plId "Provides a code action to split case")
+descriptor _ plId = (defaultPluginDescriptor plId "Provides the split case code action")
   { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction suggestCaseSplitProvider
   , pluginPriority = 1
   }
@@ -84,20 +84,20 @@ suggestCaseSplitProvider
   state
   _
   CodeActionParams{ _textDocument
-                  , _range = range
+                  , _range
                   }
   = do
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
-  verTxtDocId <- liftIO $ runAction "what to put here?" state $ getVersionedTextDoc _textDocument
+  verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
 
-  ((On Ext.UnicodeSyntax `elem`) . extensions . hsc_dflags . hscEnv -> isUnicodeSyntax)
-    <- runActionE "whatever here" state $ useE GhcSessionDeps nfp
+  (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
 
-  pm <- runActionE "not important, as long as unique" state
-      $ useE GetParsedModule nfp
+  let isUnicodeSyntax = On Ext.UnicodeSyntax `elem` extensions dynFlags
 
-  (fromJust -> fileDiags) <- activeDiagnosticsInRange (shakeExtras state) nfp range
+  pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
+
+  (fromJust -> fileDiags) <- activeDiagnosticsInRange (shakeExtras state) nfp _range
 
   -- TODO: I don't like this stair-casing, but if I don't, then I have to invent a few names.
   -- Any better approach?
@@ -109,7 +109,7 @@ suggestCaseSplitProvider
         -- if none left, return no action
         [] -> pure $ InL []
         -- if some left
-        (fileDiagAndDsMsg)
+        fileDiagAndDsMsg
 
             -> case fileDiagAndDsMsg
                   -- assume at least one entry
@@ -127,7 +127,7 @@ suggestCaseSplitProvider
             (old, new) <- handleMaybeM (PluginInternalError "Unable to makeEditText")
                 $ liftIO
                 $ runMaybeT
-                $ makeEditText pm pmAltsConApp range `runReaderT` isUnicodeSyntax
+                $ makeEditText pm pmAltsConApp _range `runReaderT` isUnicodeSyntax
 
             caps <- lift pluginGetClientCapabilities
 
@@ -158,20 +158,21 @@ suggestCaseSplitProvider
             DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> Just [] -- TODO: implement this
             _ -> error "This should not be possible."
 
--- Assign an `Ordering` to two `Range`s of which either is assumed to be subset of the other.
+-- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
+-- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
 ordSubrange :: Range -> Range -> Ordering
 ordSubrange r1 r2
   | r1 == r2 = EQ
   | r1 `isSubrangeOf` r2 = LT
   | r2 `isSubrangeOf` r1 = GT
-  | otherwise = error "Not meant to be used this way"
+  | otherwise = error "ordSubrange: ranges are not subranges of each other"
 
 _DsMessage :: Fold GhcMessage DsMessage
 _DsMessage = prism' GhcDsMessage $ \case
   GhcDsMessage dsmsg -> Just dsmsg
   _ -> Nothing
 
-makeEditText :: (MonadPlus m, MonadReader Bool m) => ParsedModule -> MissingPatterns -> Range -> m (T.Text, T.Text)
+makeEditText :: (MonadPlus m, MonadReader Bool m) => ParsedModule -> MissingPatterns -> Range -> m (Text, Text)
 makeEditText pm missingPs range = do
 
   isUnicodeSyntax <- ask
@@ -198,7 +199,7 @@ makeEditText pm missingPs range = do
                              existingPs@(MG _ (L (EpAnn (getHasLoc -> endSSpan) _ _) _))
                         | range `inSpan`  caseExprSpan caseSSpan ofSSpan endSSpan
                         -> do put True
-                              missingPs' <- sequence $ makeMatch <$> missingPs
+                              missingPs' <- traverse makeMatch missingPs
                               pure $ HsCase x e $ addMissingPatterns missingPs' existingPs
                       _ -> pure node
 
@@ -226,7 +227,7 @@ getStartLine = srcSpanStartLine . realSrcSpan . getLoc
 setDP :: Int -> Int -> LocatedAn t a -> LocatedAn t a
 setDP = (flip setEntryDP .) . deltaPos
 
--- Add semicolon, unless one is already present.
+-- | Add semicolon, unless one is already present.
 addSemiCol :: LocatedAn AnnListItem a -> LocatedAn AnnListItem a
 addSemiCol (L l@(EpAnn _ ls _) e)
   | none isSemiCol (lann_trailing ls)
@@ -234,6 +235,7 @@ addSemiCol (L l@(EpAnn _ ls _) e)
 addSemiCol l = l
 
 addMissingPatterns :: [LMatch GhcPs (LHsExpr GhcPs)] -> MatchGroup GhcPs (LHsExpr GhcPs) -> MatchGroup GhcPs (LHsExpr GhcPs)
+-- no matches present yet
 addMissingPatterns missing mg@(MG { mg_alts = L l [] })
   = mg { mg_alts = L l (fmt missing) }
     where
@@ -244,6 +246,7 @@ addMissingPatterns missing mg@(MG { mg_alts = L l [] })
               else zipWith ($)
                            (setDP 1 defaultIndent:repeat (setDP 1 0))
 
+-- there are already existing patterns - add the ones that are missing
 addMissingPatterns missing mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings })
   = case ann of
       (fmap (getStartCol . getHasLoc) . al_anchor &&& al_brackets -> (Just anchor, brackets))
@@ -256,8 +259,7 @@ addMissingPatterns missing mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existing
                nGrps = length ptrnGrps
                -- length of the last group of ≥1 patterns written on one line
                nLastGr = ptrnGrps
-                       & reverse
-                       & head
+                       & last
                        & length
                (indent, addSemiCols)
                  = if isBraced altsLoc
@@ -313,4 +315,4 @@ defaultIndent :: Int
 defaultIndent = 2
 
 none :: Foldable t => (a -> Bool) -> t a -> Bool
-none = all . (not <$>)
+none p xs = not $ any p xs
