@@ -49,7 +49,7 @@ import Ide.Types (defaultPluginDescriptor, mkPluginHandler, pluginGetClientCapab
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon), HsLocalBindsLR (EmptyLocalBinds))
 import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Type.Reflection (eqTypeRep, type (:~~:) (HRefl), typeRep, typeOf)
-import qualified Data.List.NonEmpty.Extra as NE (singleton, minimumBy1, fromList)
+import qualified Data.List.NonEmpty.Extra as NE (singleton, fromList, NonEmpty, zipWith, toList, map, splitAt)
 import           Data.Text (Text)
 import qualified Data.Text                                as T
 import qualified Development.IDE.Core.Shake               as Shake
@@ -61,6 +61,9 @@ import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
 import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
 import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
 import Control.Monad.Trans.Except (throwE)
+import Data.List.NonEmpty (NonEmpty((:|)))
+import Data.List.NonEmpty.Extra ((|:))
+import Data.Semigroup (sconcat)
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -128,8 +131,9 @@ suggestCaseSplitProvider
 
   if | Nothing <- pmAltsConApps
           -> throwE $ PluginInternalError "Error in retrieving missing patterns."
-     | Just pmAltsConApps <- pmAltsConApps
-     , not $ null pmAltsConApps -> do
+     | Just [] <- pmAltsConApps
+          -> pure $ InL [] -- This happens when the type of the expression is unknown.
+     | Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps -> do
 
         (old, new) <- liftIO $ makeEditText pm pmAltsConApps cursor arrowSyntax
 
@@ -144,9 +148,6 @@ suggestCaseSplitProvider
                        , _edit        = Just $ diffText caps (verTxtDocId, old) new IncludeDeletions
                        , _command     = Nothing
                        , _data_       = Nothing }]
-
-     | otherwise -> pure $ InL [] -- This happens when the type of the expression is unknown.
-
   where
 
     getMaybeDsMsg :: FileDiagnostic -> Maybe DsMessage
@@ -280,17 +281,14 @@ addSemiCol l = l
 -- line as there are in the last line of the pre-existing ones (see
 -- `TSomePatternsOnOneLineNoBraces.hs` and
 -- `TSomePatternsOnOneLineNoBraces.expected.hs`).
-appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> [LMatch GhcPs (LHsExpr GhcPs)] -> MatchGroup GhcPs (LHsExpr GhcPs)
+appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> NE.NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> MatchGroup GhcPs (LHsExpr GhcPs)
 -- no matches present yet
 appendMissingPats mg@(MG { mg_alts = L l [] }) missing
-  = mg { mg_alts = L l (fmt missing) }
+  = mg { mg_alts = L l (NE.toList $ NE.zipWith ($) (fmt $ isBraced l) missing) }
     where
-      fmt = if isBraced l
-              then zipWith3 (.)
-                            (repeat $ setDP 1 defaultIndent)
-                            (replicate (length missing - 1) addSemiCol ++ [id])
-              else zipWith ($)
-                           (setDP 1 defaultIndent:repeat (setDP 1 0))
+      fmt True = NE.map (setDP 1 defaultIndent .)
+               $ replicate (length missing - 1) addSemiCol |: id
+      fmt False = setDP 1 defaultIndent :| repeat (setDP 1 0)
 
       -- | Default indentation, with respect to the current layout context, to
       -- use when there's no matches present yet.
@@ -302,7 +300,7 @@ appendMissingPats mg@(MG { mg_alts = L l [] }) missing
 appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) missing
   = if | let brackets = al_brackets ann
        , Just anchor <- getStartCol . getHasLoc <$> al_anchor ann
-        -> mg { mg_alts = L altsLoc (alts anchor brackets) }
+        -> mg { mg_alts = L altsLoc (NE.toList $ alts anchor brackets) }
        | otherwise -> error "This should not be possible"
   where
     alts anchor brackets
@@ -313,26 +311,37 @@ appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) miss
                nLastGr = ptrnGrps
                        & last
                        & length
-               missingGrps = chunksOf nLastGr missing
-                           <&> \case [] -> error "Impossible"
-                                     (m:ms) -> zipWith ($) (replicate (length ms) addSemiCol ++ [id])
-                                                           (setDP 1 indent m:map (setDP 0 1) ms)
+               missingGrps = chunksOf1 nLastGr missing
+                           <&> \case (m :| ms) -> NE.zipWith ($)
+                                                             (replicate (length ms) addSemiCol |: id)
+                                                             (setDP 1 indent m :| map (setDP 0 1) ms)
                (indent, addSemiCols)
                  = if isBraced altsLoc
                        then (anchor - case brackets of
                                      ListBraces (EpTok (getStartCol . getHasLoc -> col)) _ -> col
                                      _ -> error "this is impossible"
-                            ,zipWith ($) (replicate (nGrps - 1) id
-                                       <> replicate (length missingGrps) (mapLast addSemiCol)
-                                       <> [id]))
+                            ,NE.zipWith ($) (replicate (nGrps - 1) id <> replicate (length missingGrps) (mapLast addSemiCol) |: id))
                        else (0, id)
 
-           in concat $ addSemiCols $ ptrnGrps <> missingGrps
+           in sconcat $ addSemiCols $ NE.fromList (map NE.fromList ptrnGrps) <> missingGrps
 
-mapLast :: (a -> a) -> [a] -> [a]
-mapLast f [a] = [f a]
-mapLast f (a:as) = a:mapLast f as
-mapLast _ [] = error "nope"
+-- | Version of `Data.List.Extra.chunksOf` (**not** to be confused with
+-- `Data.List.Split.chunksOf`) for a `NonEmpty` lists.
+chunksOf1 :: Int -> NE.NonEmpty a -> NE.NonEmpty (NE.NonEmpty a)
+chunksOf1 n xs
+  | n >= 1
+  , (b:before, after) <- NE.splitAt n xs
+    = (b :| before) :| case after of
+                         [] -> []
+                         _ -> map NE.fromList $ chunksOf n after
+  | otherwise = error "chunksOf1: the `Int` argument should be ≥ 1"
+
+-- | Maps a funciton f over the last element of a `NonEmpty` list.
+mapLast :: (a -> a) -> NE.NonEmpty a -> NE.NonEmpty a
+mapLast f (a :| []) = f a :| []
+mapLast f (a :| as) = a :| mapLast' f as
+  where
+    mapLast' f as = init as ++ [f $ last as]
 
 isSemiCol :: TrailingAnn -> Bool
 isSemiCol (AddSemiAnn _) = True
@@ -361,7 +370,7 @@ makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor)
                       }
 makeMatch _ = error "boom"
 
-type MissingPatterns = [PmAltConApp]
+type MissingPatterns = NE.NonEmpty PmAltConApp
 
 none :: Foldable t => (a -> Bool) -> t a -> Bool
 none p xs = not $ any p xs
