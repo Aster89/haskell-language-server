@@ -64,6 +64,8 @@ import Control.Monad.Trans.Except (throwE)
 import Data.List.NonEmpty (NonEmpty((:|)))
 import Data.List.NonEmpty.Extra ((|:))
 import Data.Semigroup (sconcat)
+import Control.Monad (MonadPlus, mzero)
+import Control.Monad.Trans.Maybe (runMaybeT)
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -197,7 +199,7 @@ makeEditText pm missingPs cursor arrowSyntax =
 
   let ps = pm_parsed_source pm
       old = T.pack $ exactPrint ps
-      ps' = everywhereM go ps -- We transform the `ParsedSource` bottom-up
+      ps' = runMaybeT (everywhereM go ps) -- We transform the `ParsedSource` bottom-up, allowing failure
             `evalStateT` False -- and we pass a `Bool` through `State` to update only one node.
             `runReader` arrowSyntax
       new = T.pack $ exactPrint ps'
@@ -205,7 +207,7 @@ makeEditText pm missingPs cursor arrowSyntax =
   in (old, new)
 
     where
-      go :: forall d m. (MonadState Bool m, MonadReader IsUnicodeSyntax m, Data d) => d -> m d
+      go :: forall d m. (MonadPlus m, MonadState Bool m, MonadReader IsUnicodeSyntax m, Data d) => d -> m d
       go node = do
           found <- get
           if | not found
@@ -228,8 +230,12 @@ makeEditText pm missingPs cursor arrowSyntax =
                      -- ^ take note we've found the node,
                      missingPs' <- traverse makeMatch missingPs
                      -- ^ make a match out of each missing pattern,
-                     pure $ HsCase extCase scrut $ appendMissingPats existingPs missingPs'
+                     case appendMissingPats existingPs missingPs' of
                      -- ^ and append missing patterns to existing ones.
+                        Nothing -> mzero
+                        -- ^ If something goes wrong, we communicate abortion,
+                        Just newPats -> pure $ HsCase extCase scrut newPats
+                        -- ^ otherwise we continue.
              | otherwise -> pure node
              -- ^ Anything else, leave the node unchanged.
 
@@ -245,7 +251,8 @@ inSpan :: Range -> SrcSpan -> Bool
 inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
 -- | Given a `MatchGroup` and a list of `LMatch`s, this function inserts the
--- latter matches in the former group, trying to honor the existing layout.
+-- latter matches in the former group, trying to honor the existing layout,
+-- returning in the `Maybe` monad to account for failure.
 --
 -- When no existing matches are present yet, we insert the missing ones one per
 -- line, adding semicolons if the alternatives are braced.
@@ -254,10 +261,10 @@ inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 -- line as there are in the last line of the pre-existing ones (see
 -- `TSomePatternsOnOneLineNoBraces.hs` and
 -- `TSomePatternsOnOneLineNoBraces.expected.hs`).
-appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> NE.NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> MatchGroup GhcPs (LHsExpr GhcPs)
+appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> NE.NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
 -- no matches present yet
 appendMissingPats mg@(MG { mg_alts = L l [] }) missing
-  = mg { mg_alts = L l (NE.toList $ NE.zipWith ($) (fmt $ isBraced l) missing) }
+  = Just $ mg { mg_alts = L l (NE.toList $ NE.zipWith ($) (fmt $ isBraced l) missing) }
     where
       -- TODO: explain more in detail
       fmt NotBraced = setDP 1 defaultIndent :| repeat (setDP 1 0)
@@ -274,8 +281,8 @@ appendMissingPats mg@(MG { mg_alts = L l [] }) missing
 appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) existings }) missing
   = if | let brackets = al_brackets ann
        , Just anchor <- getStartCol . getHasLoc <$> al_anchor ann
-        -> mg { mg_alts = L altsLoc (NE.toList $ alts anchor brackets) }
-       | otherwise -> error "This should not be possible"
+        -> Just $ mg { mg_alts = L altsLoc (NE.toList $ alts anchor brackets) }
+       | otherwise -> Nothing
   where
     -- TODO: explain more in detail
     alts anchor brackets
@@ -304,7 +311,7 @@ isSemiCol :: TrailingAnn -> Bool
 isSemiCol (AddSemiAnn _) = True
 isSemiCol _ = False
 
-makeMatch :: MonadReader IsUnicodeSyntax m => PmAltConApp -> m (LMatch GhcPs (LHsExpr GhcPs))
+makeMatch :: (MonadPlus m, MonadReader IsUnicodeSyntax m) => PmAltConApp -> m (LMatch GhcPs (LHsExpr GhcPs))
 makeMatch PACA{ paca_con = PmAltConLike (RealDataCon ctor)
               , paca_ids }
         = do arrow <- ask
