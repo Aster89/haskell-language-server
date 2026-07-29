@@ -135,7 +135,7 @@ suggestCaseSplitProvider
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
      | Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps -> do
 
-        (old, new) <- liftIO $ makeEditText pm pmAltsConApps cursor arrowSyntax
+        let (old, new) = makeEditText pm pmAltsConApps cursor arrowSyntax
 
         caps <- lift pluginGetClientCapabilities
 
@@ -192,8 +192,8 @@ type MissingPatterns = NE.NonEmpty PmAltConApp
 -- to the existing ones in the innermost `case` expression enclosing the
 -- `Range` of the cursor, using the arrow style passed as the last
 -- `IsUnicodeSyntax` argument.
-makeEditText :: ParsedModule -> MissingPatterns -> Range -> IsUnicodeSyntax -> IO (Text, Text)
-makeEditText pm missingPs cursor arrowSyntax = do
+makeEditText :: ParsedModule -> MissingPatterns -> Range -> IsUnicodeSyntax -> (Text, Text)
+makeEditText pm missingPs cursor arrowSyntax =
 
   let ps = pm_parsed_source pm
       old = T.pack $ exactPrint ps
@@ -202,7 +202,7 @@ makeEditText pm missingPs cursor arrowSyntax = do
             `runReader` arrowSyntax
       new = T.pack $ exactPrint ps'
 
-  pure (old, new)
+  in (old, new)
 
     where
       go :: forall d m. (MonadState Bool m, MonadReader IsUnicodeSyntax m, Data d) => d -> m d
