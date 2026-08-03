@@ -65,7 +65,14 @@ codeActionTests = testGroup
       getActionByTitle title
 
   -- LambdaCase
-  , expectNoCodeActionAvailable "LambdaCase not implemented yet" "TLambdaCase"
+  , goldenWithClass "LambdaCase, no patterns, no braces" "TLambdaCaseNoPatternsNoBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase, no patterns, with braces" "TLambdaCaseNoPatternsWithBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase, some patterns, no braces" "TLambdaCaseSomePatternsNoBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase, some patterns, with braces" "TLambdaCaseSomePatternsWithBraces" $
+      getActionByTitle title
 
   -- Inside where
   , expectNoCodeActionAvailable "Inside `where`, without signature" "TInsideWhereWithoutSignature"
