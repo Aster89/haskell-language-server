@@ -40,7 +40,7 @@ import Development.IDE.Types.Diagnostics (_SomeStructuredMessage, FileDiagnostic
 import GHC (DynFlags(extensions), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, EpToken (EpTok), AnnList (AnnList), AnnListBrackets (ListBraces), LMatch)
 import GHC (EpAnn(EpAnn))
 import GHC.Driver.DynFlags (OnOff(On))
-import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName, DeltaPos (deltaColumn), getDeltaLine, HsRecFields(HsRecFields))
+import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName, DeltaPos (deltaColumn), getDeltaLine, HsRecFields(HsRecFields), EpAnnLam (EpAnnLam), XCase, XLam)
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
 import GHC.Parser.Annotation (noSrcSpanA, EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax, UnicodeSyntax), emptyComments, TrailingAnn (AddSemiAnn), addTrailingAnnToA, AnnList (al_anchor))
 import GHC.Types.Name.Reader (nameRdrName)
@@ -51,7 +51,7 @@ import Ide.Plugin.Error (getNormalizedFilePathE, PluginError (PluginInternalErro
 import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
 import Ide.Types (defaultPluginDescriptor, mkPluginHandler, pluginGetClientCapabilities, PluginDescriptor(pluginHandlers, pluginPriority), PluginId, PluginMethodHandler)
 import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon, RecCon), HsLocalBindsLR (EmptyLocalBinds))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole), Match (..), GRHSs (GRHSs), GRHS (GRHS))
+import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole, HsLam), Match (..), GRHSs (GRHSs), GRHS (GRHS))
 import Type.Reflection (eqTypeRep, type (:~~:) (HRefl), typeRep, typeOf)
 import           Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.List.NonEmpty as NE (singleton, fromList, zipWith, toList, map, splitAt, groupBy1, length, last)
@@ -152,7 +152,7 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
     dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
     dsMsgToPmAlts =
       \case DsNonExhaustivePatterns CaseAlt _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
-            DsNonExhaustivePatterns (LamAlt LamCase) _ _ _ _ -> Just [] -- TODO: implement this
+            DsNonExhaustivePatterns (LamAlt LamCase) _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             _ -> Nothing
 
 caseSplitPluginCodeActionTitle :: Text
@@ -215,18 +215,11 @@ makeEditText pm missingPs cursor arrowSyntax =
                not found
                -- only inspect nodes of the appropriate type,
              , Just HRefl <- typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs)
-               -- only inspect @case@ expressions (and deconstruct the bits),
-             , HsCase extCase scrut existingPs <- node
-               -- extract @case@ and @of@ tokens,
-             , EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- extCase
-               -- extract the end-of-case-expression "token",
-             , MG _ (L (EpAnn endTok _ _) _) <- existingPs
-               -- get the location for the three tokens,
-             , let caseSSpan = getHasLoc caseTok
-                   ofSSpan = getHasLoc ofTok
-                   endSSpan = getHasLoc endTok
+               -- only inspect @case@ or @\case@ expressions, and extract the
+               -- existing ptterns and the span the whole expression occupies,
+             , Just (span, existingPs, caseLikeNode) <- parseCaseLikeExpr node
                -- make sure the cursor is somewhere in this @case@ expression,
-             , cursor `inSpan` caseExprSpan caseSSpan ofSSpan endSSpan
+             , cursor `inSpan` span
                -> do -- take note we've found the node,
                      put True
                      -- make a match out of each missing pattern,
@@ -236,9 +229,46 @@ makeEditText pm missingPs cursor arrowSyntax =
                         -- If something goes wrong, we communicate abortion,
                         Nothing -> mzero
                         -- otherwise we continue.
-                        Just newPats -> pure $ HsCase extCase scrut newPats
+                        Just newPats -> pure $ setPatterns caseLikeNode newPats
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
+
+
+-- | While @HsExpr GhcPs@ can contain any expression, the following refined
+-- type can only contain a @case@ or a @\case@ expression.
+data CaseOrLamCase = Case (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
+                   | LambdaCase (XLam GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
+
+-- | Parse an @HsCase _ _ mg@ or @HsLam _ LamCase mg@ out of a @HsExpr GhcPs@,
+-- and return:
+--
+--      - the span it occupies
+--      - the match group `mg` it contains,
+--      - and the input `HsExpr GhcPs` information, but wrapped in the refined
+--        type 'CaseOrLamCase'.
+parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (SrcSpan, MatchGroup GhcPs (LHsExpr GhcPs), CaseOrLamCase)
+parseCaseLikeExpr (HsCase ext scrut ps)
+  | MG _ (L (EpAnn endTok _ _) _) <- ps
+  , EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
+  , let caseSSpan = getHasLoc caseTok
+        ofSSpan = getHasLoc ofTok
+        endSSpan = getHasLoc endTok
+  = Just (caseExprSpan caseSSpan ofSSpan endSSpan, ps, Case ext scrut ps)
+parseCaseLikeExpr (HsLam ext LamCase ps)
+  | MG _ (L (EpAnn endTok _ _) _) <- ps
+  , EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
+  , let backslashSSpan = getHasLoc backslashTok
+        caseSSpan = getHasLoc caseTok
+        endSSpan = getHasLoc endTok
+  = Just (caseExprSpan backslashSSpan caseSSpan endSSpan, ps, LambdaCase ext ps)
+parseCaseLikeExpr _ = Nothing
+
+-- | Given a @case@ or @\case@ expression wrapped in our refined
+-- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
+-- @HsExpr GhcPs@ with that 'MatchGroup' in it.
+setPatterns :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
+setPatterns (Case x s _) mg = HsCase x s mg
+setPatterns (LambdaCase x _) mg = HsLam x LamCase mg
 
 -- | Given the 'SrcSpan' of the @case@ token, the @of@ token, and the end of
 -- the alternatives, this function combines them to return a 'SrcSpan' that goes
