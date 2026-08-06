@@ -5,7 +5,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE MultiWayIf        #-}
-{-# LANGUAGE OrPatterns #-}
+{-# LANGUAGE OrPatterns        #-}
 
 module Ide.Plugin.CaseSplit
   ( caseSplitPluginCodeActionTitle
@@ -15,7 +15,7 @@ module Ide.Plugin.CaseSplit
 
 import Control.Arrow ((&&&))
 import Control.Lens (Fold, prism', (^?), (<&>), (^.))
-import Control.Monad (mzero)
+import Control.Monad (mzero, join)
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.State.Strict (MonadState (get, put), State, evalState)
 import Control.Monad.Trans (lift)
@@ -26,9 +26,8 @@ import Data.Data (Data())
 import Data.Function (on, (&))
 import Data.Generics.Schemes (everywhereM)
 import Data.List (minimumBy)
-import Data.List.Extra (chunksOf)
-import Data.Maybe (mapMaybe)
-import Data.Semigroup (sconcat)
+import Data.List.Extra (chunksOf, takeEnd, dropEnd)
+import Data.Maybe (mapMaybe, isJust, listToMaybe)
 import Development.IDE (Pretty (pretty), Recorder, WithPriority, IdeState (shakeExtras), FileDiagnostic (fdStructuredMessage), runAction, GetParsedModule (GetParsedModule), srcSpanToRange, HscEnvEq (hscEnv), GhcSessionDeps (GhcSessionDeps))
 import Development.IDE.Core.FileStore (getVersionedTextDoc)
 import Development.IDE.Core.PluginUtils (runActionE, useE, activeDiagnosticsInRange)
@@ -42,7 +41,7 @@ import GHC (EpAnn(EpAnn))
 import GHC.Driver.DynFlags (OnOff(On))
 import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName, DeltaPos (deltaColumn), getDeltaLine, HsRecFields(HsRecFields), EpAnnLam (EpAnnLam), XCase, XLam)
 import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
-import GHC.Parser.Annotation (noSrcSpanA, EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax, UnicodeSyntax), emptyComments, TrailingAnn (AddSemiAnn), addTrailingAnnToA, AnnList (al_anchor))
+import GHC.Parser.Annotation (noSrcSpanA, EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax, UnicodeSyntax), emptyComments, TrailingAnn (AddSemiAnn), addTrailingAnnToA)
 import GHC.Types.Name.Reader (nameRdrName)
 import GHC.Types.SrcLoc (SrcSpan(RealSrcSpan), GenLocated (L), combineSrcSpans)
 import GHC.Types.Unique.SDFM (lookupUSDFM)
@@ -66,6 +65,7 @@ import           Language.LSP.Protocol.Types (Range, CodeActionParams(CodeAction
 import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
 import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
 import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
+import Control.Applicative ((<|>))
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -101,26 +101,26 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  fileDiagAndDsMsg
-    <- if | (Nothing; Just []) <- fileDiags
-             -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
-          | Just fileDiags@(_:_) <- fileDiags
-             -> fileDiags
-                -- pair each file diag with its ds messages, if any
-                & fmap (id &&& getMaybeDsMsg)
-                -- discard those with 'Nothing' ds messages and unwrap the surviving 'Just's
-                & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-                -- wrap back in the monad
-                & pure
+  fileDiagAndDsMsg <-
+    if | (Nothing; Just []) <- fileDiags
+          -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
+       | Just fileDiags@(_:_) <- fileDiags
+          -> fileDiags
+             -- pair each file diag with its ds messages, if any
+             & map (id &&& getMaybeDsMsg)
+             -- discard those with 'Nothing' ds messages and unwrap the surviving 'Just's
+             & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+             -- wrap back in the monad
+             & pure
 
   (diag, pmAltsConApps) <-
     if | null fileDiagAndDsMsg
           -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
        | otherwise
           -> fileDiagAndDsMsg
-             -- obtain the innermost
+             -- obtain the innermost diag-and-message
              & minimumBy (ordSubrange `on` Diag._range . fdLspDiagnostic . fst)
-             -- extract the 'Diagnostic' and the pattern-match constructos
+             -- extract the 'Diagnostic' and the pattern-match constructors
              & bimap fdLspDiagnostic dsMsgToPmAlts
              & pure
 
@@ -128,18 +128,21 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
           -> throwE PluginStaleResolve
      | Just [] <- pmAltsConApps
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
-     | Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps
+     | -- encode the information that there's more than one construtor
+       Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps
+       -- determine old and new text of the module
      , Just (old, new) <- makeEditText pm pmAltsConApps cursor arrowSyntax -> do
-
         caps <- lift pluginGetClientCapabilities
-
+        -- compute the edit
+        let edit = diffText caps (verTxtDocId, old) new IncludeDeletions
+        -- return the action
         pure $ InL [InR
           $ CodeAction { _title       = caseSplitPluginCodeActionTitle
                        , _kind        = Just CodeActionKind_QuickFix
                        , _diagnostics = Just [diag]
                        , _isPreferred = Nothing
                        , _disabled    = Nothing
-                       , _edit        = Just $ diffText caps (verTxtDocId, old) new IncludeDeletions
+                       , _edit        = Just edit
                        , _command     = Nothing
                        , _data_       = Nothing }]
      | otherwise
@@ -215,21 +218,24 @@ makeEditText pm missingPs cursor arrowSyntax =
                not found
                -- only inspect nodes of the appropriate type,
              , Just HRefl <- typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs)
-               -- only inspect @case@ or @\case@ expressions, and extract the
-               -- existing ptterns and the span the whole expression occupies,
-             , Just (span, existingPs, caseLikeNode) <- parseCaseLikeExpr node
-               -- make sure the cursor is somewhere in this @case@ expression,
+               -- parse @case@-like expressions, and extract the 'SrcSpan' the
+               -- whole expression occupies, as well as the indentation of the
+               -- first alternative (see 'parseCaseLikeExpr' for more details),
+             , Just (caseLikeNode, span, indent) <- parseCaseLikeExpr node
+               -- make sure the cursor is somewhere in that span,
              , cursor `inSpan` span
                -> do -- take note we've found the node,
                      put True
                      -- make a match out of each missing pattern,
                      let missingPs' = traverse (makeMatch arrow) missingPs
-                     -- and append missing patterns to existing ones.
-                     case appendMissingPats existingPs =<< missingPs' of
+                     -- extract existing matches
+                     let existingMatches = getMatchGroup caseLikeNode
+                     -- and append the missing to ones to them.
+                     case appendMissingPats indent existingMatches =<< missingPs' of
                         -- If something goes wrong, we communicate abortion,
                         Nothing -> mzero
                         -- otherwise we continue.
-                        Just newPats -> pure $ setPatterns caseLikeNode newPats
+                        Just newPats -> pure $ setMatches caseLikeNode newPats
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
 
@@ -239,36 +245,46 @@ makeEditText pm missingPs cursor arrowSyntax =
 data CaseOrLamCase = Case (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
                    | LambdaCase (XLam GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
 
+-- | Get the 'MatchGroup' out of a 'CaseOrLamCase'.
+getMatchGroup :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs)
+getMatchGroup (Case _ _ mg) = mg
+getMatchGroup (LambdaCase _ mg) = mg
+
 -- | Parse an @HsCase _ _ mg@ or @HsLam _ LamCase mg@ out of a @HsExpr GhcPs@,
 -- and return:
 --
---      - the span it occupies
---      - the match group `mg` it contains,
---      - and the input `HsExpr GhcPs` information, but wrapped in the refined
---        type 'CaseOrLamCase'.
-parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (SrcSpan, MatchGroup GhcPs (LHsExpr GhcPs), CaseOrLamCase)
-parseCaseLikeExpr (HsCase ext scrut ps)
+--      - the input `HsExpr GhcPs` information, but wrapped in the refined
+--        type 'CaseOrLamCase',
+--      - the 'SrcSpan' it occupies,
+--      - the indentation of the first existin match. TODO: finish this doc.
+parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (CaseOrLamCase, SrcSpan, Maybe Int)
+parseCaseLikeExpr (HsCase ext scrut ps@(MG { mg_alts = L altsLoc existingMatches }))
   | MG _ (L (EpAnn endTok _ _) _) <- ps
   , EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
-  , let caseSSpan = getHasLoc caseTok
+  , let indent = do openingBraceCol <- getOpeningBraceCol altsLoc
+                    (do fstExistingCol <- getStartCol <$> listToMaybe existingMatches
+                        Just (fstExistingCol - openingBraceCol)) <|> Just (indentation def)
+        caseSSpan = getHasLoc caseTok
         ofSSpan = getHasLoc ofTok
         endSSpan = getHasLoc endTok
-  = Just (caseExprSpan caseSSpan ofSSpan endSSpan, ps, Case ext scrut ps)
+        span = caseExprSpan caseSSpan ofSSpan endSSpan
+  = Just (Case ext scrut ps, span, indent)
 parseCaseLikeExpr (HsLam ext LamCase ps)
   | MG _ (L (EpAnn endTok _ _) _) <- ps
   , EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
   , let backslashSSpan = getHasLoc backslashTok
         caseSSpan = getHasLoc caseTok
         endSSpan = getHasLoc endTok
-  = Just (caseExprSpan backslashSSpan caseSSpan endSSpan, ps, LambdaCase ext ps)
+        span = caseExprSpan backslashSSpan caseSSpan endSSpan
+  = Just (LambdaCase ext ps, span, Just (indentation def)) -- TODO: change `indentation def` for something better when there are existing matches
 parseCaseLikeExpr _ = Nothing
 
 -- | Given a @case@ or @\case@ expression wrapped in our refined
 -- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
 -- @HsExpr GhcPs@ with that 'MatchGroup' in it.
-setPatterns :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
-setPatterns (Case x s _) mg = HsCase x s mg
-setPatterns (LambdaCase x _) mg = HsLam x LamCase mg
+setMatches :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
+setMatches (Case x s _) mg = HsCase x s mg
+setMatches (LambdaCase x _) mg = HsLam x LamCase mg
 
 -- | Given the 'SrcSpan' of the @case@ token, the @of@ token, and the end of
 -- the alternatives, this function combines them to return a 'SrcSpan' that goes
@@ -282,6 +298,7 @@ inSpan :: Range -> SrcSpan -> Bool
 inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
 -- | Given a 'MatchGroup' and a list of 'LMatch'es, this function inserts the
+-- TODO: explain also the additional argument's meaning.
 -- latter matches in the former group, trying to honor the existing layout,
 -- returning the new 'MatchGroup' in the 'Maybe' monad to account for failure.
 --
@@ -291,126 +308,122 @@ inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 --
 --      - adding semicolons wherever they are needed, i.e.
 --
---        - if patterns are braced, for every patterns,
+--        - if matches are braced, for every matches,
 --
---        - otherwise, for all but the last patterns for groups of patterns
+--        - otherwise, for all but the last matches for groups of matches
 --          that are not aligned vertically, e.g.
 --
---            - patterns shown on the same line, which this plugin can produce,
+--            - matches shown on the same line, which this plugin can produce,
 --
---            - patterns shown on different lines but in a "staircase" way,
+--            - matches shown on different lines but in a "staircase" way,
 --              which this plugin never produces).
 --
---      - using the correct indentation when patterns are not braced (when
---        patterns are braced, the code will stay valid irrespective of the
+--      - using the correct indentation when matches are not braced (when
+--        matches are braced, the code will stay valid irrespective of the
 --        indentation of the alternatives).
 --
 --   2. such valid code tries to adhere to the existing layout, which means:
 --
---      - don't alter position of existing patterns nor of the opening @{@;
+--      - don't alter position of existing matches nor of the opening @{@;
 --
---      - when patterns are not braced, we align the first pattern we insert
---        with the pre-existing previous pattern
+--      - when matches are not braced, we align the first match we insert
+--        with the pre-existing previous match
 --
 --      - we have to make some arbitrary decision
 --
---        - when patterns are not braced and no previous pattern exists,
+--        - when matches are not braced and no previous match exists,
 --          we indent by @indentation def@ with respect to whatever layout
 --          context is the current one;
 --
---        - as regards the number of patterns to print per line, we inspect the
---          last group of patterns appearing on one line, to determine how many
---          patterns per line we insert.
+--        - as regards the number of matches to print per line, we inspect the
+--          last group of matches appearing on one line, to determine how many
+--          matches per line we insert.
 --
---        - when patterns are braced, we also align them vertically (it would
+--        - when matches are braced, we also align them vertically (it would
 --          not be necessary, in principle).
 --
 --
 -- Refer to test cases to see practical examples.
-appendMissingPats :: MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
--- No matches present yet,
-appendMissingPats mg@(MG { mg_alts = L l [] }) missing
-  = Just $ mg { mg_alts = L l (NE.toList $ NE.zipWith ($)
-                                                      (fmt $ getOpeningBraceCol l) -- so we format every
-                                                      missing                      -- pattern to insert.
-                              ) }
-    where
-      -- | Formatting here means to indent and, if needed, to add semicolons to
-      -- the **individual** (hence the return type is a list of endomorphisms)
-      -- matches to be inserted.
-      --
-      -- The @Maybe Int@ argument encodes whether the alternatives are wrapped
-      -- in braces and, if so, it provides the column where the @{@ is located.
-      fmt :: Maybe Int -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs) -> LMatch GhcPs (LHsExpr GhcPs))
-      fmt = -- Each pattern is put on its own line
-            NE.map (setDPLine 1 .)
-          . \case
-                  -- When patterns are not braced, the the first pattern is
-                  -- indented by @indentation def@ (with respect to the current
-                  -- layout context), and all following patterns are on the
-                  -- same column as that.
-                  Nothing -> setDPCol (indentation def) :| repeat (setDPCol 0)
-                  -- When patterns are braced,
-                  Just _ -> -- all patterns are indented by @indentation def@,
-                            -- because they are all referred to the opening @{@
-                            NE.map (setDPCol (indentation def) .)
-                            -- and all but the last pattern need a @;@.
-                          $ replicate (length missing - 1) addSemiCol |: id
+appendMissingPats :: Maybe Int -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
+appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
+  = let -- Group the matches to be inserted in chunks,
+        missingGroup :| missingGroups = prettyChunksOf size missingMatches
+        -- and let the size of such chunks be
+        size = case existingMatches of
+                 [] -> 1 -- trivially 1 if there's no existing matches,
+                      -- otherwise, set the size equal to the length
+                      -- of the last group of existingMatches that
+                      -- are on the same line:
+                 _ -> NE.length
+                    $ NE.last
+                    $ NE.groupBy1 isOnelined (NE.fromList existingMatches)
 
--- There are already existing patterns, so we can safely turn the input list in
--- a 'NonEmpty'.
-appendMissingPats mg@(MG { mg_alts = L altsLoc@(EpAnn _ ann _) (NE.fromList -> existings) }) missing
-  = if | -- Retrieve the column of the anchor.
-         Just anchor <- getStartCol . getHasLoc <$> al_anchor ann
-       , let
-             -- Group patterns that are on the same line,
-             ptrnGrps = NE.groupBy1 isOnelined existings
-             -- and get the length of the last group.
-             nLastGr = NE.length $ NE.last ptrnGrps
+        -- Detect if the list of alternatives is between @{@ and @}@.
+        isBraced = isJust $ getOpeningBraceCol altsLoc
+        addSemicols = NE.zipWith ($) (replicate (length missingGroups) (mapLast addSemiCol) |: id)
 
-             missingGrps = -- Group the patterns to be inserted with the same
-                           -- stride as the length of the last group.
-                           chunksOf1 nLastGr missing
-                           -- For each group
-                         <&> \ms -> NE.zipWith ($)
-                                               (NE.zipWith (.)
-                                                           -- only the first pattern goes
-                                                           -- on a new line and is indented,
-                                                           -- while the others go on the
-                                                           -- same line, one space apart;
-                                                           (setDP 1 indent :| repeat (setDP 0 1))
-                                                           -- all but the last pattern
-                                                           -- get a semicolon.
-                                                           (replicate (length ms - 1) addSemiCol |: id)) -- TODO: gimme a name
-                                               ms
+        existingMatchesEP = if isBraced -- Only if there's braces
+                               then -- Do we need to make sure the last of the
+                                    -- existing matches ends with @;@
+                                    dropEnd 1 existingMatches <> (addSemiCol <$> takeEnd 1 existingMatches)
+                               else existingMatches
 
-             -- Here we compute the indent (used above) and the function to add
-             -- semicolons, to the end of each group:
-             (indent, addSemiCols) = case getOpeningBraceCol altsLoc of
-                -- if the patters are not braced, then all inserted patterns
-                -- need 0 indentation and no semicolon;
-                Nothing -> (0, id)
-                -- if they are braced, then
-                Just openingBrace ->
-                                     -- they need to be indented with respect
-                                     -- to the opening brace
-                                     ( anchor - openingBrace
-                                     -- and all but the last item need a
-                                     -- semicolon (and we avoid, checking the
-                                     -- non-last groups because they're
-                                     -- supposed to have the semicolon already
-                                     , NE.zipWith ($)
-                                                  (replicate (NE.length ptrnGrps - 1) id <>
-                                                   replicate (length missingGrps) (mapLast addSemiCol) |: id)
-                                     )
+        -- Indentation is complicated.
+        --
+        -- For a non-braced @case@ expression (the non-@Just@ matches of the
+        -- @case@ below), the first match **of the whole expression** (I mean,
+        -- not the first match **to be inserted**) has some anchor that depends
+        -- on the surrounding code, while the following matches all use their
+        -- predecessor as the anchor.
+        --
+        -- Otherwise (i.e. braced @case@ and braced-or-not @\case@, the @Just@
+        -- match in the @case@ below), all matches including the first one have
+        -- the same anchor that depends on the surrounding code.
+        --
+        -- Therefore, here's how we set the DeltaPos for the first and following
+        -- matches:
+        (setDPCol -> indentHead, setDPCol -> indentTail)
+           = case mayIndent of
+               -- non-braced @case@ with some existing matches
+               Nothing | null existingMatches -> (indentation def, 0)
+               -- non-braced @case@ with no existing match
+               Nothing -> (0, 0)
+               -- braced @case@ or braced-or-not @\case@
+               Just i -> (i, i)
 
-        -> Just $ mg { mg_alts = L altsLoc (NE.toList $ sconcat $ addSemiCols $ ptrnGrps <> missingGrps) }
+        -- Finally, we lay out the missing matches:
+        missingMatchesEP = -- indent the first group and the following ones (see discussion above)
+                           mapFirst indentHead missingGroup :| map (mapFirst indentTail) missingGroups
+                           -- add a semicolon to the end of each group only if the alternatives are braced
+                         & (if isBraced then addSemicols else id)
+                           -- put each group on its own line
+                         & NE.map (mapFirst putOnNewLine)
+                           -- join the groups
+                         & join
+                           -- turn into an ordinary list
+                         & NE.toList
 
-       | otherwise -> Nothing
+    in Just $ mg { mg_alts = L altsLoc (existingMatchesEP <> missingMatchesEP) }
 
-isSemiCol :: TrailingAnn -> Bool
-isSemiCol (AddSemiAnn _) = True
-isSemiCol _ = False
+-- | Accepts a @NonEmpty (LocatedAn AnnListItem a)@ and chunkifies it by the given 'size',
+-- keeping it valid code by
+--
+--    - adding semicolons to the 'init' of each group,
+--    - setting the 'tail' of each group on the same line as the 'head', leaving 1 space.
+prettyChunksOf :: Int -> NonEmpty (LocatedAn AnnListItem a) -> NonEmpty (NonEmpty (LocatedAn AnnListItem a))
+prettyChunksOf size matches = chunksOf1 size matches
+  -- For each chunk
+  <&> \ms -> NE.zipWith ($)
+                        (NE.zipWith (.)
+                                    -- only the first match goes
+                                    -- on a new line and is indented,
+                                    -- while the others go on the
+                                    -- same line, one space apart;
+                                    (id :| repeat (setDP 0 1))
+                                    -- all but the last match
+                                    -- get a semicolon.
+                                    (replicate (length ms - 1) addSemiCol |: id)) -- TODO: gimme a name
+                        ms
 
 -- | Given a 'PmAltConApp', this function produces an 'LMatch' to be inserted
 -- in the list of existing 'LMatch'es contained by a 'MatchGroup'.
@@ -515,12 +528,19 @@ setDPLine :: Int -> LocatedAn t a -> LocatedAn t a
 setDPLine deltaLine lann = setEntryDP lann
                           $ (\d -> deltaPos deltaLine (deltaColumn d))
                           $ getEntryDP lann
+-- | Useful helper.
+putOnNewLine :: LocatedAn t a -> LocatedAn t a
+putOnNewLine = setDPLine 1
 
 -- | Add semicolon, unless one is already present.
 addSemiCol :: LocatedAn AnnListItem a -> LocatedAn AnnListItem a
 addSemiCol (L l@(EpAnn _ ls _) e)
   | none isSemiCol (lann_trailing ls)
   = L (addTrailingAnnToA (AddSemiAnn (EpTok d0)) emptyComments l) e
+  where
+    isSemiCol :: TrailingAnn -> Bool
+    isSemiCol (AddSemiAnn _) = True
+    isSemiCol _ = False
 addSemiCol l = l
 
 -- | Version of 'Data.List.Extra.chunksOf' (**not** to be confused with
@@ -534,7 +554,11 @@ chunksOf1 n xs
                          _ -> map NE.fromList $ chunksOf n after
   | otherwise = error "chunksOf1: the `Int` argument should be ≥ 1"
 
--- | Maps a funciton f over the last element of a 'NonEmpty' list.
+-- | Maps a function @f@ over the first element of a 'NonEmpty' list.
+mapFirst :: (a -> a) -> NonEmpty a -> NonEmpty a
+mapFirst f (a :| as) = f a :| as
+
+-- | Maps a function @f@ over the last element of a 'NonEmpty' list.
 mapLast :: (a -> a) -> NonEmpty a -> NonEmpty a
 mapLast f (a :| []) = f a :| []
 mapLast f (a :| as) = a :| mapLast' f as

@@ -11,4 +11,5 @@ data X = A
        | F
 
 foo :: X -> Int
-foo x = (\case) x
+foo x = do (\case { A -> 1;
+                    B -> 2 }) x
