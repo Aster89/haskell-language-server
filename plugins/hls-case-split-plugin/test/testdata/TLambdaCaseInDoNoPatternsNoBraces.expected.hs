@@ -10,5 +10,11 @@ data X = A
        | E
        | F
 
-foo :: X -> Maybe Int
-foo x = pure x >>= \case
+foo :: X -> Int
+foo x = do  (  \   case
+              A -> _
+              B -> _
+              C _ -> _
+              D _ _ -> _
+              E -> _
+              F -> _) x

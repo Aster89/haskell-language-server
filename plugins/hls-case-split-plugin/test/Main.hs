@@ -73,6 +73,14 @@ codeActionTests = testGroup
       getActionByTitle title
   , goldenWithClass "LambdaCase, some patterns, with braces" "TLambdaCaseSomePatternsWithBraces" $
       getActionByTitle title
+  , goldenWithClass "LambdaCase in `do`, no patterns, no braces" "TLambdaCaseInDoNoPatternsNoBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase in `do`, no patterns, with braces" "TLambdaCaseInDoNoPatternsWithBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase in `do`, some patterns, no braces" "TLambdaCaseInDoSomePatternsNoBraces" $
+      getActionByTitle title
+  , goldenWithClass "LambdaCase in `do`, some patterns, with braces" "TLambdaCaseInDoSomePatternsWithBraces" $
+      getActionByTitle title
 
   -- Inside where
   , expectNoCodeActionAvailable "Inside `where`, without signature" "TInsideWhereWithoutSignature"
