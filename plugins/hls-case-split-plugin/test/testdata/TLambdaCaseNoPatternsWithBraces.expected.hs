@@ -12,9 +12,9 @@ data X = A
 
 foo :: X -> Maybe Int
 foo x = pure x >>= \case {
-  A -> _;
-  B -> _;
-  C _ -> _;
-  D _ _ -> _;
-  E -> _;
-  F -> _}
+                           A -> _;
+                           B -> _;
+                           C _ -> _;
+                           D _ _ -> _;
+                           E -> _;
+                           F -> _}

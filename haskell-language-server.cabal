@@ -607,6 +607,7 @@ library hls-case-split-plugin
     , syb
     , text
     , transformers
+    , ghc-exactprint        >= 1.14.1.0
 
   default-extensions:
     DataKinds
