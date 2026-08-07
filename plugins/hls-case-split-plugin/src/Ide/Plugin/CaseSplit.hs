@@ -1,12 +1,12 @@
+{-# LANGUAGE ApplicativeDo     #-}
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE ViewPatterns      #-}
-{-# LANGUAGE RecordWildCards   #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE MultiWayIf        #-}
 {-# LANGUAGE OrPatterns        #-}
-{-# LANGUAGE ApplicativeDo     #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE TypeFamilies      #-}
+{-# LANGUAGE ViewPatterns      #-}
 
 module Ide.Plugin.CaseSplit
   ( caseSplitPluginCodeActionTitle
@@ -14,59 +14,137 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
-import Control.Arrow ((&&&))
-import Control.Lens (Fold, prism', (^?), (^.))
-import Control.Monad (mzero, join)
-import Control.Monad.IO.Class (MonadIO(liftIO))
-import Control.Monad.State.Strict (MonadState (get, put), State, evalState)
-import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Except (throwE)
-import Control.Monad.Trans.Maybe (runMaybeT, MaybeT)
-import Data.Bifunctor (bimap)
-import Data.Data (Data())
-import Data.Function (on, (&))
-import Data.Generics.Schemes (everywhereM)
-import Data.List (minimumBy)
-import Data.List.Extra (chunksOf, takeEnd, dropEnd)
-import Data.Maybe (mapMaybe, isJust, listToMaybe)
-import Development.IDE (Pretty (pretty), Recorder, WithPriority, IdeState (shakeExtras), FileDiagnostic (fdStructuredMessage), runAction, GetParsedModule (GetParsedModule), srcSpanToRange, HscEnvEq (hscEnv), GhcSessionDeps (GhcSessionDeps))
-import Development.IDE.Core.FileStore (getVersionedTextDoc)
-import Development.IDE.Core.PluginUtils (runActionE, useE, activeDiagnosticsInRange)
-import Development.IDE.GHC.Compat (GhcMessage (GhcDsMessage), HsMatchContext (CaseAlt), ConLike (RealDataCon), NamedThing (getName), HoleKind (HoleVar), HscEnv (hsc_dflags), Id)
-import Development.IDE.GHC.Compat (getLoc)
-import Development.IDE.GHC.Compat.Error (DsMessage(DsNonExhaustivePatterns), msgEnvelopeErrorL)
-import Development.IDE.GHC.Compat.ExactPrint (exactPrint, d0, d1, noAnnSrcSpanDP1, setEntryDP, getEntryDP)
-import Development.IDE.Types.Diagnostics (_SomeStructuredMessage, FileDiagnostic (fdLspDiagnostic))
-import GHC (DynFlags(extensions), ParsedModule (pm_parsed_source), HasLoc (getHasLoc), realSrcSpan, EpToken (EpTok), AnnList (AnnList), AnnListBrackets (ListBraces), LMatch)
-import GHC (EpAnn(EpAnn))
-import GHC.Driver.DynFlags (OnOff(On))
-import GHC.Hs (GhcPs, deltaPos, unnamedHoleRdrName, DeltaPos (deltaColumn), getDeltaLine, HsRecFields(HsRecFields), EpAnnLam (EpAnnLam), XCase, XLam)
-import GHC.HsToCore.Pmc.Solver.Types (PmAltConApp(..), PmAltCon(..), TmState (ts_facts), Nabla (nabla_tm_st), VarInfo (vi_pos))
-import GHC.Parser.Annotation (noSrcSpanA, EpUniToken (EpUniTok), IsUnicodeSyntax (NormalSyntax, UnicodeSyntax), emptyComments, TrailingAnn (AddSemiAnn), addTrailingAnnToA)
-import GHC.Types.Name.Reader (nameRdrName)
-import GHC.Types.SrcLoc (SrcSpan(RealSrcSpan), GenLocated (L), combineSrcSpans)
-import GHC.Types.Unique.SDFM (lookupUSDFM)
-import Ide.Logger ((<+>))
-import Ide.Plugin.Error (getNormalizedFilePathE, PluginError (PluginInternalError, PluginStaleResolve))
-import Ide.PluginUtils (diffText, WithDeletions (IncludeDeletions))
-import Ide.Types (defaultPluginDescriptor, mkPluginHandler, pluginGetClientCapabilities, PluginDescriptor(pluginHandlers, pluginPriority), PluginId, PluginMethodHandler)
-import Language.Haskell.Syntax (MatchGroup (MG, mg_alts), LHsExpr, NoExtField (NoExtField), Pat (..), HsConDetails (PrefixCon, RecCon), HsLocalBindsLR (EmptyLocalBinds))
-import Language.Haskell.Syntax.Expr (HsExpr (HsCase, HsHole, HsLam), Match (..), GRHSs (GRHSs), GRHS (GRHS))
-import Type.Reflection (eqTypeRep, type (:~~:) (HRefl), typeRep, typeOf)
-import           Data.List.NonEmpty (NonEmpty((:|)))
-import qualified Data.List.NonEmpty as NE (singleton, fromList, zipWith, toList, map, splitAt, groupBy1, length, last)
-import           Data.List.NonEmpty.Extra ((|:))
-import           Data.Text (Text)
-import qualified Data.Text                                as T
-import qualified Development.IDE.Core.Shake               as Shake
-import qualified Language.LSP.Protocol.Lens                   as L
-import           Language.LSP.Protocol.Message (Method(Method_TextDocumentCodeAction))
-import qualified Language.LSP.Protocol.Message            as LSP
-import           Language.LSP.Protocol.Types (Range, CodeActionParams(CodeActionParams, _range, _textDocument), CodeActionKind(CodeActionKind_QuickFix), type (|?)(InR, InL), CodeAction(..), isSubrangeOf)
-import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
-import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
-import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
-import Control.Applicative ((<|>), ZipList (ZipList, getZipList))
+import           Control.Applicative                   (ZipList (ZipList, getZipList),
+                                                        (<|>))
+import           Control.Arrow                         ((&&&))
+import           Control.Lens                          (Fold, prism', (^.),
+                                                        (^?))
+import           Control.Monad                         (join, mzero)
+import           Control.Monad.IO.Class                (MonadIO (liftIO))
+import           Control.Monad.State.Strict            (MonadState (get, put),
+                                                        State, evalState)
+import           Control.Monad.Trans                   (lift)
+import           Control.Monad.Trans.Except            (throwE)
+import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
+import           Data.Bifunctor                        (bimap)
+import           Data.Data                             (Data)
+import           Data.Function                         (on, (&))
+import           Data.Generics.Schemes                 (everywhereM)
+import           Data.List                             (minimumBy)
+import           Data.List.Extra                       (chunksOf, dropEnd,
+                                                        takeEnd)
+import           Data.List.NonEmpty                    (NonEmpty ((:|)))
+import qualified Data.List.NonEmpty                    as NE
+import           Data.List.NonEmpty.Extra              ((|:))
+import           Data.Maybe                            (isJust, listToMaybe,
+                                                        mapMaybe)
+import           Data.Text                             (Text)
+import qualified Data.Text                             as T
+import           Development.IDE                       (FileDiagnostic (fdStructuredMessage),
+                                                        GetParsedModule (GetParsedModule),
+                                                        GhcSessionDeps (GhcSessionDeps),
+                                                        HscEnvEq (hscEnv),
+                                                        IdeState (shakeExtras),
+                                                        Pretty (pretty),
+                                                        Recorder, WithPriority,
+                                                        runAction,
+                                                        srcSpanToRange)
+import           Development.IDE.Core.FileStore        (getVersionedTextDoc)
+import           Development.IDE.Core.PluginUtils      (activeDiagnosticsInRange,
+                                                        runActionE, useE)
+import qualified Development.IDE.Core.Shake            as Shake
+import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
+                                                        GhcMessage (GhcDsMessage),
+                                                        HoleKind (HoleVar),
+                                                        HsMatchContext (CaseAlt),
+                                                        HscEnv (hsc_dflags), Id,
+                                                        NamedThing (getName),
+                                                        getLoc)
+import           Development.IDE.GHC.Compat.Core       (AnnListItem,
+                                                        EpAnnHsCase (EpAnnHsCase),
+                                                        GrhsAnn (..),
+                                                        HasSrcSpan,
+                                                        HsLamVariant (LamCase),
+                                                        HsMatchContext (LamAlt),
+                                                        LocatedAn,
+                                                        lann_trailing,
+                                                        srcSpanStartCol,
+                                                        srcSpanStartLine)
+import qualified Development.IDE.GHC.Compat.Core       as Ext
+import           Development.IDE.GHC.Compat.Error      (DsMessage (DsNonExhaustivePatterns),
+                                                        msgEnvelopeErrorL)
+import           Development.IDE.GHC.Compat.ExactPrint (d0, d1, exactPrint,
+                                                        getEntryDP,
+                                                        noAnnSrcSpanDP1,
+                                                        setEntryDP)
+import           Development.IDE.Types.Diagnostics     (FileDiagnostic (fdLspDiagnostic),
+                                                        _SomeStructuredMessage)
+import           GHC                                   (AnnList (AnnList),
+                                                        AnnListBrackets (ListBraces),
+                                                        DynFlags (extensions),
+                                                        EpAnn (EpAnn),
+                                                        EpToken (EpTok),
+                                                        HasLoc (getHasLoc),
+                                                        LMatch,
+                                                        ParsedModule (pm_parsed_source),
+                                                        realSrcSpan)
+import           GHC.Driver.DynFlags                   (OnOff (On))
+import           GHC.Hs                                (DeltaPos (deltaColumn),
+                                                        EpAnnLam (EpAnnLam),
+                                                        GhcPs,
+                                                        HsRecFields (HsRecFields),
+                                                        XCase, XLam, deltaPos,
+                                                        getDeltaLine,
+                                                        unnamedHoleRdrName)
+import           GHC.HsToCore.Pmc.Solver.Types         (Nabla (nabla_tm_st),
+                                                        PmAltCon (..),
+                                                        PmAltConApp (..),
+                                                        TmState (ts_facts),
+                                                        VarInfo (vi_pos))
+import           GHC.Parser.Annotation                 (EpUniToken (EpUniTok),
+                                                        IsUnicodeSyntax (NormalSyntax, UnicodeSyntax),
+                                                        TrailingAnn (AddSemiAnn),
+                                                        addTrailingAnnToA,
+                                                        emptyComments,
+                                                        noSrcSpanA)
+import           GHC.Types.Name.Reader                 (nameRdrName)
+import           GHC.Types.SrcLoc                      (GenLocated (L),
+                                                        SrcSpan (RealSrcSpan),
+                                                        combineSrcSpans)
+import           GHC.Types.Unique.SDFM                 (lookupUSDFM)
+import           Ide.Logger                            ((<+>))
+import           Ide.Plugin.Error                      (PluginError (PluginInternalError, PluginStaleResolve),
+                                                        getNormalizedFilePathE)
+import           Ide.PluginUtils                       (WithDeletions (IncludeDeletions),
+                                                        diffText)
+import           Ide.Types                             (PluginDescriptor (pluginHandlers, pluginPriority),
+                                                        PluginId,
+                                                        PluginMethodHandler,
+                                                        defaultPluginDescriptor,
+                                                        mkPluginHandler,
+                                                        pluginGetClientCapabilities)
+import           Language.Haskell.Syntax               (HsConDetails (PrefixCon, RecCon),
+                                                        HsLocalBindsLR (EmptyLocalBinds),
+                                                        LHsExpr,
+                                                        MatchGroup (MG, mg_alts),
+                                                        NoExtField (NoExtField),
+                                                        Pat (..))
+import           Language.Haskell.Syntax.Expr          (GRHS (GRHS),
+                                                        GRHSs (GRHSs),
+                                                        HsExpr (HsCase, HsHole, HsLam),
+                                                        Match (..))
+import qualified Language.LSP.Protocol.Lens            as L
+import           Language.LSP.Protocol.Message         (Method (Method_TextDocumentCodeAction))
+import qualified Language.LSP.Protocol.Message         as LSP
+import           Language.LSP.Protocol.Types           (CodeAction (..),
+                                                        CodeActionKind (CodeActionKind_QuickFix),
+                                                        CodeActionParams (CodeActionParams, _range, _textDocument),
+                                                        Range, isSubrangeOf,
+                                                        type (|?) (InL, InR))
+import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
+import           Type.Reflection                       (eqTypeRep,
+                                                        type (:~~:) (HRefl),
+                                                        typeOf, typeRep)
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -234,7 +312,7 @@ makeEditText pm missingPs cursor arrowSyntax =
                      -- and append the missing to ones to them.
                      case appendMissingPats indent existingMatches =<< missingPs' of
                         -- If something goes wrong, we communicate abortion,
-                        Nothing -> mzero
+                        Nothing      -> mzero
                         -- otherwise we continue.
                         Just newPats -> pure $ setMatches caseLikeNode newPats
              -- Anything else, leave the node unchanged.
@@ -251,7 +329,7 @@ data CaseOrLamCase = Case (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsEx
 
 -- | Get the 'MatchGroup' out of a 'CaseOrLamCase'.
 getMatchGroup :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs)
-getMatchGroup (Case _ _ mg) = mg
+getMatchGroup (Case _ _ mg)     = mg
 getMatchGroup (LambdaCase _ mg) = mg
 
 -- | Parse an @HsCase _ _ mg@ or @HsLam _ LamCase mg@ out of a @HsExpr GhcPs@,
@@ -306,7 +384,7 @@ getIndentation (MG { mg_alts = L altsLoc existingMatches })
 -- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
 -- @HsExpr GhcPs@ with that 'MatchGroup' in it.
 setMatches :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
-setMatches (Case x s _) mg = HsCase x s mg
+setMatches (Case x s _) mg     = HsCase x s mg
 setMatches (LambdaCase x _) mg = HsLam x LamCase mg
 
 -- | Given the 'SrcSpan' of the @case@ token, the @of@ token, and the end of
@@ -421,9 +499,9 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
                    -- non-braced with some existing matches
                    Nothing | null existingMatches -> (indentation def, 0)
                    -- non-braced without existing matches
-                   Nothing -> (0, 0)
+                   Nothing                        -> (0, 0)
                    -- braced
-                   Just i -> (i, i)
+                   Just i                         -> (i, i)
 
         -- Only if there's braces do we need to make sure the last of the
         -- existing matches ends with @;@:
@@ -511,7 +589,7 @@ data Default = Default {
   maxUnderscores :: Int
   -- | Indentation used when there's no existing alternatives to refer to.
   -- Such indentation is with respect to the current layout context.
-, indentation :: Int
+, indentation    :: Int
   -- TODO other things that we could store here are:
   --
   --    - the maximum number of alternatives on one line
@@ -568,7 +646,7 @@ addSemiCol (L l@(EpAnn _ ls _) e)
   where
     isSemiCol :: TrailingAnn -> Bool
     isSemiCol (AddSemiAnn _) = True
-    isSemiCol _ = False
+    isSemiCol _              = False
 addSemiCol l = l
 
 -- | Version of 'Data.List.Extra.chunksOf' (**not** to be confused with
@@ -579,7 +657,7 @@ chunksOf1 n xs
   , (b:before, after) <- NE.splitAt n xs
     = (b :| before) :| case after of
                          [] -> []
-                         _ -> map NE.fromList $ chunksOf n after
+                         _  -> map NE.fromList $ chunksOf n after
   | otherwise = error "chunksOf1: the `Int` argument should be ≥ 1"
 
 -- | Maps a function @f@ over the first element of a 'NonEmpty' list.
