@@ -6,6 +6,7 @@
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE MultiWayIf        #-}
 {-# LANGUAGE OrPatterns        #-}
+{-# LANGUAGE ApplicativeDo     #-}
 
 module Ide.Plugin.CaseSplit
   ( caseSplitPluginCodeActionTitle
@@ -14,7 +15,7 @@ module Ide.Plugin.CaseSplit
   ) where
 
 import Control.Arrow ((&&&))
-import Control.Lens (Fold, prism', (^?), (<&>), (^.))
+import Control.Lens (Fold, prism', (^?), (^.))
 import Control.Monad (mzero, join)
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.State.Strict (MonadState (get, put), State, evalState)
@@ -65,7 +66,7 @@ import           Language.LSP.Protocol.Types (Range, CodeActionParams(CodeAction
 import qualified Language.LSP.Protocol.Types as Diag (Diagnostic(_range))
 import           Development.IDE.GHC.Compat.Core (GrhsAnn(..), HasSrcSpan, srcSpanStartLine, LocatedAn, lann_trailing, AnnListItem, srcSpanStartCol, EpAnnHsCase (EpAnnHsCase), HsMatchContext (LamAlt), HsLamVariant (LamCase))
 import qualified Development.IDE.GHC.Compat.Core as Ext (Extension (UnicodeSyntax))
-import Control.Applicative ((<|>))
+import Control.Applicative ((<|>), ZipList (ZipList, getZipList))
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -433,24 +434,24 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
     in Just $ mg { mg_alts = L altsLoc (existingMatchesEP <> missingMatchesEP) }
 
 -- | Accepts a @NonEmpty (LocatedAn AnnListItem a)@ and chunkifies it by the given 'size',
--- keeping it valid code by
---
---    - adding semicolons to the 'init' of each group,
---    - setting the 'tail' of each group on the same line as the 'head', leaving 1 space.
+-- putting all matches of each chunk on the same line, leaving 1 space in between, and
+-- keeping the code valid by adding semicolons to all but the last match of each chunk.
 prettyChunksOf :: Int -> NonEmpty (LocatedAn AnnListItem a) -> NonEmpty (NonEmpty (LocatedAn AnnListItem a))
-prettyChunksOf size matches = chunksOf1 size matches
+prettyChunksOf size allMatches = do
   -- For each chunk
-  <&> \ms -> NE.zipWith ($)
-                        (NE.zipWith (.)
-                                    -- only the first match goes
-                                    -- on a new line and is indented,
-                                    -- while the others go on the
-                                    -- same line, one space apart;
-                                    (id :| repeat (setDP 0 1))
-                                    -- all but the last match
-                                    -- get a semicolon.
-                                    (replicate (length ms - 1) addSemiCol |: id))
-                        ms
+  chunk <- chunksOf1 size allMatches
+  pure $ fromZipList
+       $ do -- of all the matches of chunk
+            match       <- toZipList chunk
+            -- from the second match onwards, they go the same line, one space apart
+            putBeside   <- toZipList $ id :| repeat (setDP 0 1)
+            -- all but the last match get a semicolon
+            addSemicols <- toZipList $ replicate (length chunk - 1) addSemiCol |: id
+            -- apply
+            pure $ addSemicols $ putBeside match
+  where
+    toZipList = ZipList . NE.toList
+    fromZipList = NE.fromList . getZipList
 
 -- | Given a 'PmAltConApp', this function produces an 'LMatch' to be inserted
 -- in the list of existing 'LMatch'es contained by a 'MatchGroup'.
