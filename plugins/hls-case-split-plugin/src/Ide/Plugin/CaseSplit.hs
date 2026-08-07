@@ -239,6 +239,9 @@ makeEditText pm missingPs cursor arrowSyntax =
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
 
+      -- | Predicate telling the given 'Range' falls within the given 'SrcSpan'.
+      inSpan :: Range -> SrcSpan -> Bool
+      inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
 -- | While @HsExpr GhcPs@ can contain any expression, the following refined
 -- type can only contain a @case@ or a @\case@ expression.
@@ -255,29 +258,48 @@ getMatchGroup (LambdaCase _ mg) = mg
 --
 --      - the input `HsExpr GhcPs` information, but wrapped in the refined
 --        type 'CaseOrLamCase',
---      - the 'SrcSpan' it occupies,
---      - the indentation of the first existin match. TODO: finish this doc.
+--      - the 'SrcSpan' the parsed expression occupies,
+--      - the indentation of the first existing match (see also
+--        'getIndentation').
 parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (CaseOrLamCase, SrcSpan, Maybe Int)
-parseCaseLikeExpr (HsCase ext scrut ps@(MG { mg_alts = L altsLoc existingMatches }))
-  | MG _ (L (EpAnn endTok _ _) _) <- ps
-  , EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
-  , let indent = do openingBraceCol <- getOpeningBraceCol altsLoc
-                    (do fstExistingCol <- getStartCol <$> listToMaybe existingMatches
-                        Just (fstExistingCol - openingBraceCol)) <|> Just (indentation def)
-        caseSSpan = getHasLoc caseTok
+
+parseCaseLikeExpr (HsCase ext scrut ps)
+  | EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
+  , let caseSSpan = getHasLoc caseTok
         ofSSpan = getHasLoc ofTok
-        endSSpan = getHasLoc endTok
+  , MG _ (L (EpAnn endTok _ _) _) <- ps
+  , let endSSpan = getHasLoc endTok
         span = caseExprSpan caseSSpan ofSSpan endSSpan
-  = Just (Case ext scrut ps, span, indent)
+  = Just (Case ext scrut ps, span, getIndentation ps)
+
 parseCaseLikeExpr (HsLam ext LamCase ps)
-  | MG _ (L (EpAnn endTok _ _) _) <- ps
-  , EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
+  | EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
   , let backslashSSpan = getHasLoc backslashTok
         caseSSpan = getHasLoc caseTok
-        endSSpan = getHasLoc endTok
+  , MG _ (L (EpAnn endTok _ _) _) <- ps
+  , let endSSpan = getHasLoc endTok
         span = caseExprSpan backslashSSpan caseSSpan endSSpan
-  = Just (LambdaCase ext ps, span, Just (indentation def)) -- TODO: change `indentation def` for something better when there are existing matches
+  = Just (LambdaCase ext ps, span, getIndentation ps)
+
 parseCaseLikeExpr _ = Nothing
+
+-- | Given a 'MatchGroup', this function returns
+--
+--     - 'Nothing' if the matches are not braced,
+--
+--     - @Just i@ if the matches are braced, being @i@ equal to
+--
+--         - @indentation def@ when there's no matches,
+--
+--         - otherwise, the indentation of the first alternative with respect
+--           to the @{@.
+--
+getIndentation :: MatchGroup GhcPs (LHsExpr GhcPs) -> Maybe Int
+getIndentation (MG { mg_alts = L altsLoc existingMatches })
+  = do openingBraceCol <- getOpeningBraceCol altsLoc
+       let fstExistingIndent = do fstExistingCol <- getStartCol <$> listToMaybe existingMatches
+                                  Just (fstExistingCol - openingBraceCol)
+       fstExistingIndent <|> Just (indentation def)
 
 -- | Given a @case@ or @\case@ expression wrapped in our refined
 -- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
@@ -293,14 +315,12 @@ caseExprSpan :: SrcSpan -> SrcSpan -> SrcSpan -> SrcSpan
 caseExprSpan caseSSpan _ endSSpan@(RealSrcSpan _ _) = combineSrcSpans caseSSpan endSSpan
 caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 
--- | Predicate telling the given 'Range' falls within the given 'SrcSpan'.
-inSpan :: Range -> SrcSpan -> Bool
-inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
-
 -- | Given a 'MatchGroup' and a list of 'LMatch'es, this function inserts the
--- TODO: explain also the additional argument's meaning.
 -- latter matches in the former group, trying to honor the existing layout,
 -- returning the new 'MatchGroup' in the 'Maybe' monad to account for failure.
+--
+-- For the meaning of the first argument of type @Maybe Int@, see
+-- 'getIndentation'.
 --
 -- Honoring the existing layout means two things:
 --
@@ -346,50 +366,20 @@ inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 -- Refer to test cases to see practical examples.
 appendMissingPats :: Maybe Int -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
 appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
-  = let -- Group the matches to be inserted in chunks,
+  = let -- Chunkify the matches to be inserted,
         missingGroup :| missingGroups = prettyChunksOf size missingMatches
-        -- and let the size of such chunks be
+        -- and let all chunks have a common size, which is
         size = case existingMatches of
                  [] -> 1 -- trivially 1 if there's no existing matches,
                       -- otherwise, set the size equal to the length
-                      -- of the last group of existingMatches that
+                      -- of the last group of @existingMatches@ that
                       -- are on the same line:
                  _ -> NE.length
                     $ NE.last
                     $ NE.groupBy1 isOnelined (NE.fromList existingMatches)
 
-        -- Detect if the list of alternatives is between @{@ and @}@.
+        -- Detect if the list of alternatives is between @{@ and @}@:
         isBraced = isJust $ getOpeningBraceCol altsLoc
-        addSemicols = NE.zipWith ($) (replicate (length missingGroups) (mapLast addSemiCol) |: id)
-
-        existingMatchesEP = if isBraced -- Only if there's braces
-                               then -- Do we need to make sure the last of the
-                                    -- existing matches ends with @;@
-                                    dropEnd 1 existingMatches <> (addSemiCol <$> takeEnd 1 existingMatches)
-                               else existingMatches
-
-        -- Indentation is complicated.
-        --
-        -- For a non-braced @case@ expression (the non-@Just@ matches of the
-        -- @case@ below), the first match **of the whole expression** (I mean,
-        -- not the first match **to be inserted**) has some anchor that depends
-        -- on the surrounding code, while the following matches all use their
-        -- predecessor as the anchor.
-        --
-        -- Otherwise (i.e. braced @case@ and braced-or-not @\case@, the @Just@
-        -- match in the @case@ below), all matches including the first one have
-        -- the same anchor that depends on the surrounding code.
-        --
-        -- Therefore, here's how we set the DeltaPos for the first and following
-        -- matches:
-        (setDPCol -> indentHead, setDPCol -> indentTail)
-           = case mayIndent of
-               -- non-braced @case@ with some existing matches
-               Nothing | null existingMatches -> (indentation def, 0)
-               -- non-braced @case@ with no existing match
-               Nothing -> (0, 0)
-               -- braced @case@ or braced-or-not @\case@
-               Just i -> (i, i)
 
         -- Finally, we lay out the missing matches:
         missingMatchesEP = -- indent the first group and the following ones (see discussion above)
@@ -402,6 +392,43 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
                          & join
                            -- turn into an ordinary list
                          & NE.toList
+          where
+            -- add semicolons
+            addSemicols = NE.zipWith ($)
+                                      -- for each one-line group of matches,
+                                     (replicate (length missingGroups)
+                                                -- only to the last match of the group
+                                                (mapLast addSemiCol)
+                                      -- except for the last group
+                                      |: id)
+
+            -- Indentation is complicated.
+            --
+            -- For a non-braced @case@-like expression, the first match **of the
+            -- whole expression** (I mean, not the first match **to be inserted**)
+            -- has some anchor that depends on the surrounding code, while the
+            -- following matches all use their own predecessor as the anchor.
+            --
+            -- Otherwise (i.e. for a braced @case@-like expression), all matches
+            -- including the first one have the same anchor that depends on the
+            -- surrounding code.
+            --
+            -- Therefore, here's how we set the DeltaPos for the first and
+            -- following matches:
+            (setDPCol -> indentHead, setDPCol -> indentTail)
+               = case mayIndent of
+                   -- non-braced with some existing matches
+                   Nothing | null existingMatches -> (indentation def, 0)
+                   -- non-braced without existing matches
+                   Nothing -> (0, 0)
+                   -- braced
+                   Just i -> (i, i)
+
+        -- Only if there's braces do we need to make sure the last of the
+        -- existing matches ends with @;@:
+        existingMatchesEP = if isBraced
+                               then dropEnd 1 existingMatches <> (addSemiCol <$> takeEnd 1 existingMatches)
+                               else existingMatches
 
     in Just $ mg { mg_alts = L altsLoc (existingMatchesEP <> missingMatchesEP) }
 
@@ -422,7 +449,7 @@ prettyChunksOf size matches = chunksOf1 size matches
                                     (id :| repeat (setDP 0 1))
                                     -- all but the last match
                                     -- get a semicolon.
-                                    (replicate (length ms - 1) addSemiCol |: id)) -- TODO: gimme a name
+                                    (replicate (length ms - 1) addSemiCol |: id))
                         ms
 
 -- | Given a 'PmAltConApp', this function produces an 'LMatch' to be inserted
