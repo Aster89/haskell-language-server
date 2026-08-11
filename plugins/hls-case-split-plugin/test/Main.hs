@@ -135,7 +135,6 @@ _CACodeAction = prism' InR $ \case
   InR action -> Just action
   _          -> Nothing
 
--- TODO: give appropriate name
 goldenWithRange :: TestName -> FilePath -> Range -> TestTree
 goldenWithRange title path range =
   goldenWithHaskellDocInTmpDir def caseSplitPlugin title (mkFs $ FS.directProject (path <.> "hs")) path "expected" "hs" $ \doc -> do

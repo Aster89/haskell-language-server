@@ -17,8 +17,7 @@ module Ide.Plugin.CaseSplit
 import           Control.Applicative                   (ZipList (ZipList, getZipList),
                                                         (<|>))
 import           Control.Arrow                         ((&&&))
-import           Control.Lens                          (Fold, prism', (^.),
-                                                        (^?))
+import           Control.Lens                          ((^.), (^?))
 import           Control.Monad                         (join, mzero)
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
@@ -54,7 +53,6 @@ import           Development.IDE.Core.PluginUtils      (activeDiagnosticsInRange
                                                         runActionE, useE)
 import qualified Development.IDE.Core.Shake            as Shake
 import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
-                                                        GhcMessage (GhcDsMessage),
                                                         HoleKind (HoleVar),
                                                         HsMatchContext (CaseAlt),
                                                         HscEnv (hsc_dflags), Id,
@@ -72,6 +70,7 @@ import           Development.IDE.GHC.Compat.Core       (AnnListItem,
                                                         srcSpanStartLine)
 import qualified Development.IDE.GHC.Compat.Core       as Ext
 import           Development.IDE.GHC.Compat.Error      (DsMessage (DsNonExhaustivePatterns),
+                                                        _DsMessage,
                                                         msgEnvelopeErrorL)
 import           Development.IDE.GHC.Compat.ExactPrint (d0, d1, exactPrint,
                                                         getEntryDP,
@@ -160,12 +159,11 @@ instance Pretty Log where
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor _ plId = (defaultPluginDescriptor plId "Provides the split case code action")
   { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction suggestCaseSplitProvider
-  , pluginPriority = 1
   }
 
 suggestCaseSplitProvider :: PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
-suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = cursor }
-  = do
+suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = cursor } = do
+
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
   verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
@@ -261,11 +259,6 @@ ordSubrange r1 r2
   | r2 `isSubrangeOf` r1 = GT
   | otherwise = error "ordSubrange: ranges are not subranges of each other"
 
-_DsMessage :: Fold GhcMessage DsMessage
-_DsMessage = prism' GhcDsMessage $ \case
-  GhcDsMessage dsmsg -> Just dsmsg
-  _ -> Nothing
-
 type MissingPatterns = NonEmpty PmAltConApp
 
 -- | Given a 'ParsedModule' this function uses 'exactPrint' to produce the
@@ -281,7 +274,7 @@ makeEditText pm missingPs cursor arrowSyntax =
       -- We want to update exactly one node of the AST, the one that is
       -- associated to the innermost @case@ expression containing the cursor,
       -- therefore:
-      ps' = runMaybeT (everywhereM (go arrowSyntax) ps) -- we transform the 'ParsedSource' bottom-up
+      ps' = runMaybeT (everywhereM go ps) -- we transform the 'ParsedSource' bottom-up
                                           -- (allowing failure, incidentally),
             `evalState` False -- and we pass a 'Bool' through 'State' to bail
                                -- out after one update.
@@ -290,8 +283,8 @@ makeEditText pm missingPs cursor arrowSyntax =
   in sequence (old, new)
 
     where
-      go :: forall a. Data a => IsUnicodeSyntax -> a -> MaybeT (State Bool) a
-      go arrow node = do
+      go :: forall a. Data a => a -> MaybeT (State Bool) a
+      go node = do
           found <- get
           if | -- Proceed only if we haven't found & edited the node yet,
                not found
@@ -306,7 +299,7 @@ makeEditText pm missingPs cursor arrowSyntax =
                -> do -- take note we've found the node,
                      put True
                      -- make a match out of each missing pattern,
-                     let missingPs' = traverse (makeMatch arrow) missingPs
+                     let missingPs' = traverse (makeMatch arrowSyntax) missingPs
                      -- extract existing matches
                      let existingMatches = getMatchGroup caseLikeNode
                      -- and append the missing to ones to them.
@@ -455,7 +448,7 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
                       -- are on the same line:
                  _ -> NE.length
                     $ NE.last
-                    $ NE.groupBy1 isOnelined (NE.fromList existingMatches)
+                    $ NE.groupBy1 startSameLine (NE.fromList existingMatches)
 
         -- Detect if the list of alternatives is between @{@ and @}@:
         isBraced = isJust $ getOpeningBraceCol altsLoc
@@ -602,8 +595,8 @@ def = Default { maxUnderscores = 3
 
 -- | Predicate telling if two located annotations are (actually, start) on the
 -- same line.
-isOnelined :: LocatedAn ann e -> LocatedAn ann e -> Bool
-isOnelined = (==) `on` getStartLine
+startSameLine :: LocatedAn ann e -> LocatedAn ann e -> Bool
+startSameLine = (==) `on` getStartLine
 
 -- | Given an @EpAnn (AnnList a)@ return the starting column of
 -- its opening brace, if any, otherwise 'Nothing'.
