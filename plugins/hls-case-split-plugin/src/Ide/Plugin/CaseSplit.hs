@@ -23,7 +23,7 @@ import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
 import           Control.Monad.Trans                   (lift)
-import           Control.Monad.Trans.Except            (throwE)
+import           Control.Monad.Trans.Except            (throwE, ExceptT)
 import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
 import           Data.Bifunctor                        (bimap)
 import           Data.Data                             (Data)
@@ -86,7 +86,7 @@ import           GHC                                   (AnnList (AnnList),
                                                         HasLoc (getHasLoc),
                                                         LMatch,
                                                         ParsedModule (pm_parsed_source),
-                                                        realSrcSpan)
+                                                        realSrcSpan, ParsedSource)
 import           GHC.Driver.DynFlags                   (OnOff (On))
 import           GHC.Hs                                (DeltaPos (deltaColumn),
                                                         EpAnnLam (EpAnnLam),
@@ -116,12 +116,12 @@ import           Ide.Plugin.Error                      (PluginError (PluginInter
                                                         getNormalizedFilePathE)
 import           Ide.PluginUtils                       (WithDeletions (IncludeDeletions),
                                                         diffText)
-import           Ide.Types                             (PluginDescriptor (pluginHandlers, pluginPriority),
+import           Ide.Types                             (PluginDescriptor (pluginHandlers),
                                                         PluginId,
                                                         PluginMethodHandler,
                                                         defaultPluginDescriptor,
                                                         mkPluginHandler,
-                                                        pluginGetClientCapabilities)
+                                                        pluginGetClientCapabilities, HandlerM, Config)
 import           Language.Haskell.Syntax               (HsConDetails (PrefixCon, RecCon),
                                                         HsLocalBindsLR (EmptyLocalBinds),
                                                         LHsExpr,
@@ -139,7 +139,7 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR))
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
@@ -165,8 +165,6 @@ suggestCaseSplitProvider :: PluginMethodHandler IdeState 'Method_TextDocumentCod
 suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = cursor } = do
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
-
-  verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
 
   (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
 
@@ -207,21 +205,22 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
      | -- encode the information that there's more than one construtor
        Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps
+       -- TODO: update doc
        -- determine old and new text of the module
-     , Just (old, new) <- makeEditText pm pmAltsConApps cursor arrowSyntax -> do
-        caps <- lift pluginGetClientCapabilities
-        -- compute the edit
-        let edit = diffText caps (verTxtDocId, old) new IncludeDeletions
-        -- return the action
-        pure $ InL [InR
-          $ CodeAction { _title       = caseSplitPluginCodeActionTitle
-                       , _kind        = Just CodeActionKind_QuickFix
-                       , _diagnostics = Just [diag]
-                       , _isPreferred = Nothing
-                       , _disabled    = Nothing
-                       , _edit        = Just edit
-                       , _command     = Nothing
-                       , _data_       = Nothing }]
+     , let psOld = pm_parsed_source pm
+     , Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
+          -> do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+                edit <- makeEditText verTxtDocId psOld psNew
+                -- return the action
+                pure $ InL [InR
+                  $ CodeAction { _title       = caseSplitPluginCodeActionTitle
+                               , _kind        = Just CodeActionKind_QuickFix
+                               , _diagnostics = Just [diag]
+                               , _isPreferred = Nothing
+                               , _disabled    = Nothing
+                               , _edit        = Just edit
+                               , _command     = Nothing
+                               , _data_       = Nothing }]
      | otherwise
           -> throwE $ PluginInternalError "Error in updating the AST."
   where
@@ -234,6 +233,13 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
       \case DsNonExhaustivePatterns CaseAlt _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             DsNonExhaustivePatterns (LamAlt LamCase) _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             _ -> Nothing
+
+makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
+makeEditText verTxtDocId psOld psNew = do
+  let old = T.pack $ exactPrint psOld
+  let new = T.pack $ exactPrint psNew
+  caps <- lift pluginGetClientCapabilities
+  pure $ diffText caps (verTxtDocId, old) new IncludeDeletions
 
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
@@ -261,26 +267,21 @@ ordSubrange r1 r2
 
 type MissingPatterns = NonEmpty PmAltConApp
 
--- | Given a 'ParsedModule' this function uses 'exactPrint' to produce the
+-- | TODO: update doc
+-- Given a 'ParsedModule' this function uses 'exactPrint' to produce the
 -- 'Text's of said module before and after the 'MissingPatterns' are appended
 -- to the existing ones in the innermost @case@ expression enclosing the
 -- 'Range' of the cursor, using the arrow style passed as the last
 -- 'IsUnicodeSyntax' argument.
-makeEditText :: ParsedModule -> MissingPatterns -> Range -> IsUnicodeSyntax -> Maybe (Text, Text)
-makeEditText pm missingPs cursor arrowSyntax =
-
-  let ps = pm_parsed_source pm
-      old = T.pack $ exactPrint ps
-      -- We want to update exactly one node of the AST, the one that is
-      -- associated to the innermost @case@ expression containing the cursor,
-      -- therefore:
-      ps' = runMaybeT (everywhereM go ps) -- we transform the 'ParsedSource' bottom-up
-                                          -- (allowing failure, incidentally),
-            `evalState` False -- and we pass a 'Bool' through 'State' to bail
-                               -- out after one update.
-      new = fmap (T.pack . exactPrint) ps'
-
-  in sequence (old, new)
+graftMissingPatterns :: ParsedSource -> MissingPatterns -> Range -> IsUnicodeSyntax -> Maybe ParsedSource
+graftMissingPatterns ps missingPs cursor arrowSyntax =
+  -- We want to update exactly one node of the AST, the one that is
+  -- associated to the innermost @case@ expression containing the cursor,
+  -- therefore:
+  runMaybeT (everywhereM go ps) -- we transform the 'ParsedSource' bottom-up
+                                -- (allowing failure, incidentally),
+    `evalState` False -- and we pass a 'Bool' through 'State' to bail
+                      -- out after one update.
 
     where
       go :: forall a. Data a => a -> MaybeT (State Bool) a
