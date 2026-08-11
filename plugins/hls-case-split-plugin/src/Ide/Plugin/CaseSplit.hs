@@ -139,7 +139,7 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
@@ -166,14 +166,6 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
-  (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
-
-  let arrowSyntax = if On Ext.UnicodeSyntax `elem` extensions dynFlags
-                      then UnicodeSyntax
-                      else NormalSyntax
-
-  pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
-
   fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
   fileDiagAndDsMsg <-
@@ -190,7 +182,7 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   (diag, pmAltsConApps) <-
     if | null fileDiagAndDsMsg
-          -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
+          -> throwE $ PluginInternalError "This error should be converted to just return no action"
        | otherwise
           -> fileDiagAndDsMsg
              -- obtain the innermost diag-and-message
@@ -198,6 +190,10 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
              -- extract the 'Diagnostic' and the pattern-match constructors
              & bimap fdLspDiagnostic dsMsgToPmAlts
              & pure
+
+  pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
+
+  arrowSyntax <- getArrowSyntax state nfp
 
   if | Nothing <- pmAltsConApps
           -> throwE PluginStaleResolve
@@ -240,6 +236,13 @@ makeEditText verTxtDocId psOld psNew = do
   let new = T.pack $ exactPrint psNew
   caps <- lift pluginGetClientCapabilities
   pure $ diffText caps (verTxtDocId, old) new IncludeDeletions
+
+getArrowSyntax :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) IsUnicodeSyntax
+getArrowSyntax state nfp = do
+  (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
+  pure $ if On Ext.UnicodeSyntax `elem` extensions dynFlags
+    then UnicodeSyntax
+    else NormalSyntax
 
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
