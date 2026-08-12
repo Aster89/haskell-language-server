@@ -215,20 +215,16 @@ attachDsMessages (Just fileDiags) = fileDiags
 extractDiagAndPmAltsConApps :: [(FileDiagnostic, DsMessage)] -> Maybe (Diag.Diagnostic, NonEmpty PmAltConApp)
 extractDiagAndPmAltsConApps [] = Nothing
 extractDiagAndPmAltsConApps fileDiagAndDsMsg =
-  case fileDiagAndDsMsg
-               -- extract the 'Diagnostic' and the pattern-match constructors for
-               -- each diag-and-message, only retaining those with some constructor
-               & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> nonEmpty))
-               -- discard those with 'Nothing' as alternatives and
-               -- unwrap the surviving 'Just's
-               & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-               -- obtain the innermost diag-and-message
-               of
-    [] -> Nothing
-    diagAndPmAltsConApps -> Just $ minimumBy (ordSubrange `on` Diag._range . fst) diagAndPmAltsConApps
-
+  fileDiagAndDsMsg -- extract the 'Diagnostic' and the pattern-match constructors for
+                   -- each diag-and-message, only retaining those with some constructor
+                   & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> nonEmpty))
+                   -- discard those with 'Nothing' as alternatives and
+                   -- unwrap the surviving 'Just's
+                   & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+                   & nonEmpty
+                   -- obtain the innermost diag-and-message
+                   & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
   where
-
     dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
     dsMsgToPmAlts =
       \case DsNonExhaustivePatterns CaseAlt _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
