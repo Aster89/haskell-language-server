@@ -31,7 +31,7 @@ import           Data.Generics.Schemes                 (everywhereM)
 import           Data.List                             (minimumBy)
 import           Data.List.Extra                       (chunksOf, dropEnd,
                                                         takeEnd)
-import           Data.List.NonEmpty                    (NonEmpty ((:|)))
+import           Data.List.NonEmpty                    (NonEmpty ((:|)), nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
 import           Data.List.NonEmpty.Extra              ((|:))
 import           Data.Maybe                            (isJust, listToMaybe,
@@ -168,31 +168,9 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  let fileDiagAndDsMsg = if | (Nothing; Just []) <- fileDiags
-                                -> []
-                            | Just fileDiags@(_:_) <- fileDiags
-                               -> fileDiags
-                                  -- pair each file diag with its ds messages, if any
-                                  & map (id &&& getMaybeDsMsg)
-                                  -- discard those with 'Nothing' as messages and unwrap
-                                  -- the surviving 'Just's
-                                  & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-                                  -- wrap back in the monad
+  let fileDiagAndDsMsg = attachDsMessages fileDiags
 
-  let diagAndPmAltsConApps = if | null fileDiagAndDsMsg
-                                    -> Nothing
-                                | let x = fileDiagAndDsMsg
-                                          -- extract the 'Diagnostic' and the pattern-match constructors for
-                                          -- each diag-and-message, only retaining those with some constructor
-                                          & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> NE.nonEmpty))
-                                          -- discard those with 'Nothing' as alternatives and
-                                          -- unwrap the surviving 'Just's
-                                          & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-                                          -- obtain the innermost diag-and-message
-                                , not (null x)
-                                    -> Just $ minimumBy (ordSubrange `on` Diag._range . fst) x
-                                | otherwise
-                                    -> Nothing
+  let diagAndPmAltsConApps = extractDiagAndPmAltsConApps fileDiagAndDsMsg
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
@@ -220,10 +198,36 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
                                , _data_       = Nothing }]
      | otherwise
           -> throwE $ PluginInternalError "Error in updating the AST."
-  where
 
+attachDsMessages :: Maybe [FileDiagnostic] -> [(FileDiagnostic, DsMessage)]
+attachDsMessages (Just []; Nothing) = []
+attachDsMessages (Just fileDiags) = fileDiags
+                                  -- pair each file diag with its ds messages, if any
+                                  & map (id &&& getMaybeDsMsg)
+                                  -- discard those with 'Nothing' as messages and unwrap
+                                  -- the surviving 'Just's
+                                  & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+                                  -- wrap back in the monad
+  where
     getMaybeDsMsg :: FileDiagnostic -> Maybe DsMessage
     getMaybeDsMsg d = fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage
+
+extractDiagAndPmAltsConApps :: [(FileDiagnostic, DsMessage)] -> Maybe (Diag.Diagnostic, NonEmpty PmAltConApp)
+extractDiagAndPmAltsConApps [] = Nothing
+extractDiagAndPmAltsConApps fileDiagAndDsMsg =
+  case fileDiagAndDsMsg
+               -- extract the 'Diagnostic' and the pattern-match constructors for
+               -- each diag-and-message, only retaining those with some constructor
+               & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> nonEmpty))
+               -- discard those with 'Nothing' as alternatives and
+               -- unwrap the surviving 'Just's
+               & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+               -- obtain the innermost diag-and-message
+               of
+    [] -> Nothing
+    diagAndPmAltsConApps -> Just $ minimumBy (ordSubrange `on` Diag._range . fst) diagAndPmAltsConApps
+
+  where
 
     dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
     dsMsgToPmAlts =
