@@ -55,7 +55,7 @@ import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
                                                         HsMatchContext (CaseAlt),
                                                         HscEnv (hsc_dflags), Id,
                                                         NamedThing (getName),
-                                                        getLoc)
+                                                        getLoc, DataCon, RdrName)
 import           Development.IDE.GHC.Compat.Core       (AnnListItem,
                                                         EpAnnHsCase (EpAnnHsCase),
                                                         GrhsAnn (..),
@@ -92,7 +92,7 @@ import           GHC.Hs                                (DeltaPos (deltaColumn),
                                                         HsRecFields (HsRecFields),
                                                         XCase, XLam, deltaPos,
                                                         getDeltaLine,
-                                                        unnamedHoleRdrName)
+                                                        unnamedHoleRdrName, SrcSpanAnnN)
 import           GHC.HsToCore.Pmc.Solver.Types         (Nabla (nabla_tm_st),
                                                         PmAltCon (..),
                                                         PmAltConApp (..),
@@ -553,40 +553,53 @@ prettyChunksOf size allMatches = do
 -- for the arrow, which can be @->@ or @→@ depending on whether the 'UnicodeSyntax'
 -- language extension is being used.
 makeMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe (LMatch GhcPs (LHsExpr GhcPs))
-makeMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
-                    , paca_ids
-                    }
-        = let -- Extract the name of the constructor
-              ctorName = L noSrcSpanA $ nameRdrName $ getName dataCon
-              -- assemble the construtor with the arguments, adding
-              -- underscores or empty braces:
-              ctor = case length paca_ids of
-                              -- for low number of arguments
-                              n | n <= maxUnderscores def
-                                   -- create as many underscores as needed
-                                -> ConPat { pat_con_ext = (Nothing, Nothing)
-                                          , pat_con = ctorName
-                                          , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
-                                          }
-                                   -- otherwise use braces.
-                              _ -> ConPat { pat_con_ext = (Just (EpTok d1), Just (EpTok d0))
-                                          , pat_con = ctorName
-                                          , pat_args = RecCon (HsRecFields NoExtField [] Nothing)
-                                          }
-          in do Just $ L noSrcSpanA
-                 $ Match { m_ext = NoExtField
+makeMatch arrow pmAltConApp = makeMatch'part2 <$> makeMatch'part1 arrow pmAltConApp
+
+makeCtorPattern :: GenLocated SrcSpanAnnN RdrName -> [Id] -> Pat GhcPs
+makeCtorPattern ctorName paca_ids
+  = case length paca_ids of
+      -- for low number of arguments
+      n | n <= maxUnderscores def
+           -- create as many underscores as needed
+        -> ConPat { pat_con_ext = (Nothing, Nothing)
+                  , pat_con = ctorName
+                  , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
+                  }
+           -- otherwise use braces.
+      _ -> ConPat { pat_con_ext = (Just (EpTok d1), Just (EpTok d0))
+                  , pat_con = ctorName
+                  , pat_args = RecCon (HsRecFields NoExtField [] Nothing)
+                  }
+
+makeMatch'part1 :: IsUnicodeSyntax -> PmAltConApp -> Maybe SimpleCtorMatch
+makeMatch'part1 arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
+                          , paca_ids
+                          }
+  = Just $ SimpleCtorMatch { _arrow = arrow
+                           , _dataCon = dataCon
+                           , _pacaIds = paca_ids
+                           }
+makeMatch'part1 _ _ = Nothing
+
+makeMatch'part2 :: SimpleCtorMatch -> LMatch GhcPs (LHsExpr GhcPs)
+makeMatch'part2 SimpleCtorMatch{..}
+  = L noSrcSpanA $ Match { m_ext = NoExtField
                          , m_ctxt = CaseAlt
-                         , m_pats = L noSrcSpanA [L noSrcSpanA ctor]
+                         , m_pats = L noSrcSpanA [L noSrcSpanA $ makeCtorPattern (L noSrcSpanA $ nameRdrName $ getName _dataCon) _pacaIds]
                          , m_grhss = GRHSs emptyComments
                                            -- TODO: check whether ga_sep default choice is really not printing anything.
                                            (NE.singleton $ L noSrcSpanA $ GRHS (EpAnn noSrcSpanA
                                                                                       (GrhsAnn{ ga_vbar = Nothing
-                                                                                              , ga_sep = Right $ EpUniTok d1 arrow })
+                                                                                              , ga_sep = Right $ EpUniTok d1 _arrow })
                                                                                       emptyComments) []
                                                          $ L noSrcSpanA $ HsHole $ HoleVar $ L noAnnSrcSpanDP1 $ unnamedHoleRdrName)
                                            (EmptyLocalBinds NoExtField)
                          }
-makeMatch _ _ = Nothing
+
+data SimpleCtorMatch = SimpleCtorMatch { _arrow :: IsUnicodeSyntax
+                                       , _dataCon :: DataCon
+                                       , _pacaIds :: [Id]
+                                       }
 
 data Default = Default {
   -- | Max number of underscores to show for the constructor of an alternative.
