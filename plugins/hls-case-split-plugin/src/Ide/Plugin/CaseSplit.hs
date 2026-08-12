@@ -18,7 +18,7 @@ import           Control.Applicative                   (ZipList (ZipList, getZip
                                                         (<|>))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
-import           Control.Monad                         (join, mzero)
+import           Control.Monad                         (mzero)
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
@@ -144,6 +144,7 @@ import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_ran
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
+import Data.Semigroup (sconcat)
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -465,8 +466,8 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
                          & (if isBraced then addSemicols else id)
                            -- put each group on its own line
                          & NE.map (mapFirst putOnNewLine)
-                           -- join the groups
-                         & join
+                           -- concatenate the groups
+                         & sconcat
                            -- turn into an ordinary list
                          & NE.toList
           where
