@@ -89,9 +89,11 @@ codeActionTests = testGroup
   , goldenWithClass "Inside nested `where`" "TInsideNestedWhere" $
       getActionByTitle title
 
-  -- Holes
+  -- Overlapping diagnostics
   , goldenWithClass "Expression is `_`" "TExpressionIsUnderscore" $
       getActionByTitle title
+  , goldenWithRange "Overlapping pattern matches" "TOverlappingExistingPatterns" $
+      Range (Position 15 4) (Position 15 5)
 
   -- Inside let
   , goldenWithClass "Inside `let`'s declarations" "TInsideLetDeclarations" $
