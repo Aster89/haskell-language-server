@@ -17,7 +17,7 @@ module Ide.Plugin.CaseSplit
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
-import           Control.Monad                         (mzero)
+import           Control.Monad                         (mzero, (>=>))
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
@@ -168,42 +168,40 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  fileDiagAndDsMsg <-
-    if | (Nothing; Just []) <- fileDiags
-          -> throwE $ PluginInternalError "Error in retrieving diagnostics at the cursor."
-       | Just fileDiags@(_:_) <- fileDiags
-          -> fileDiags
-             -- pair each file diag with its ds messages, if any
-             & map (id &&& getMaybeDsMsg)
-             -- discard those with 'Nothing' as @Maybe DsMessage@ and unwrap
-             -- the surviving 'Just's
-             & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-             -- wrap back in the monad
-             & pure
+  let fileDiagAndDsMsg = if | (Nothing; Just []) <- fileDiags
+                                -> []
+                            | Just fileDiags@(_:_) <- fileDiags
+                               -> fileDiags
+                                  -- pair each file diag with its ds messages, if any
+                                  & map (id &&& getMaybeDsMsg)
+                                  -- discard those with 'Nothing' as messages and unwrap
+                                  -- the surviving 'Just's
+                                  & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+                                  -- wrap back in the monad
 
-  (diag, pmAltsConApps) <-
-    if | null fileDiagAndDsMsg
-          -> throwE $ PluginInternalError "This error should be converted to just return no action"
-       | otherwise
-          -> fileDiagAndDsMsg
-             -- extract the 'Diagnostic' and the pattern-match constructors for
-             -- each diag-and-message
-             & map (bimap fdLspDiagnostic dsMsgToPmAlts)
-             -- discard those with 'Nothing' as @Maybe [PmAltConApp]@ and
-             -- unwrap the surviving 'Just's
-             & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-             -- obtain the innermost diag-and-message
-             & minimumBy (ordSubrange `on` Diag._range . fst)
-             & pure
+  let diagAndPmAltsConApps = if | null fileDiagAndDsMsg
+                                    -> Nothing
+                                | let x = fileDiagAndDsMsg
+                                          -- extract the 'Diagnostic' and the pattern-match constructors for
+                                          -- each diag-and-message, only retaining those with some constructor
+                                          & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> NE.nonEmpty))
+                                          -- discard those with 'Nothing' as alternatives and
+                                          -- unwrap the surviving 'Just's
+                                          & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+                                          -- obtain the innermost diag-and-message
+                                , not (null x)
+                                    -> Just $ minimumBy (ordSubrange `on` Diag._range . fst) x
+                                | otherwise
+                                    -> Nothing
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
   arrowSyntax <- getArrowSyntax state nfp
 
-  if | null pmAltsConApps
+  if | Nothing <- diagAndPmAltsConApps
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
      | -- encode the information that there's more than one construtor
-       (NE.fromList -> pmAltsConApps) <- pmAltsConApps
+       Just (diag, pmAltsConApps) <- diagAndPmAltsConApps
        -- TODO: update doc
        -- determine old and new text of the module
      , let psOld = pm_parsed_source pm
