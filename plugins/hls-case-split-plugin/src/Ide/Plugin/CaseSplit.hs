@@ -14,6 +14,10 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
+-- TODO: **********************REMEMBER!!!**********************
+-- make another pass with stylish-haskell
+-- TODO: **********************REMEMBER!!!**********************
+-- Review all haddock comments
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
@@ -553,39 +557,37 @@ prettyChunksOf size allMatches = do
 -- for the arrow, which can be @->@ or @→@ depending on whether the 'UnicodeSyntax'
 -- language extension is being used.
 makeMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe (LMatch GhcPs (LHsExpr GhcPs))
-makeMatch arrow pmAltConApp = makeMatch'part2 <$> makeMatch'part1 arrow pmAltConApp
+makeMatch arrow pmAltConApp = makeLMatch <$> parseSimpleConMatch arrow pmAltConApp
 
-makeCtorPattern :: GenLocated SrcSpanAnnN RdrName -> [Id] -> Pat GhcPs
-makeCtorPattern ctorName paca_ids
-  = case length paca_ids of
-      -- for low number of arguments
-      n | n <= maxUnderscores def
-           -- create as many underscores as needed
-        -> ConPat { pat_con_ext = (Nothing, Nothing)
-                  , pat_con = ctorName
-                  , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
-                  }
-           -- otherwise use braces.
-      _ -> ConPat { pat_con_ext = (Just (EpTok d1), Just (EpTok d0))
-                  , pat_con = ctorName
-                  , pat_args = RecCon (HsRecFields NoExtField [] Nothing)
-                  }
-
-makeMatch'part1 :: IsUnicodeSyntax -> PmAltConApp -> Maybe SimpleCtorMatch
-makeMatch'part1 arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
+parseSimpleConMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe SimpleConMatch
+parseSimpleConMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
                           , paca_ids
                           }
-  = Just $ SimpleCtorMatch { _arrow = arrow
-                           , _dataCon = dataCon
-                           , _pacaIds = paca_ids
-                           }
-makeMatch'part1 _ _ = Nothing
+  = let locatedCon = L noSrcSpanA $ nameRdrName $ getName dataCon
+        conPat = case length paca_ids of
+                    -- for low number of arguments
+                    n | n <= maxUnderscores def
+                         -- create as many underscores as needed
+                      -> ConPat { pat_con_ext = (Nothing, Nothing)
+                                , pat_con = locatedCon
+                                , pat_args = PrefixCon $ map (const $ L noAnnSrcSpanDP1 $ WildPat NoExtField) paca_ids
+                                }
+                         -- otherwise use braces.
+                    _ -> ConPat { pat_con_ext = (Just (EpTok d1), Just (EpTok d0))
+                                , pat_con = locatedCon
+                                , pat_args = RecCon (HsRecFields NoExtField [] Nothing)
+                                }
+    in Just
+     $ SimpleConMatch { _arrow = arrow
+                      , _conPat = conPat }
 
-makeMatch'part2 :: SimpleCtorMatch -> LMatch GhcPs (LHsExpr GhcPs)
-makeMatch'part2 SimpleCtorMatch{..}
+parseSimpleConMatch _ _ = Nothing
+
+makeLMatch :: SimpleConMatch -> LMatch GhcPs (LHsExpr GhcPs)
+makeLMatch SimpleConMatch{..}
   = L noSrcSpanA $ Match { m_ext = NoExtField
                          , m_ctxt = CaseAlt
-                         , m_pats = L noSrcSpanA [L noSrcSpanA $ makeCtorPattern (L noSrcSpanA $ nameRdrName $ getName _dataCon) _pacaIds]
+                         , m_pats = L noSrcSpanA [L noSrcSpanA _conPat]
                          , m_grhss = GRHSs emptyComments
                                            -- TODO: check whether ga_sep default choice is really not printing anything.
                                            (NE.singleton $ L noSrcSpanA $ GRHS (EpAnn noSrcSpanA
@@ -596,10 +598,9 @@ makeMatch'part2 SimpleCtorMatch{..}
                                            (EmptyLocalBinds NoExtField)
                          }
 
-data SimpleCtorMatch = SimpleCtorMatch { _arrow :: IsUnicodeSyntax
-                                       , _dataCon :: DataCon
-                                       , _pacaIds :: [Id]
-                                       }
+data SimpleConMatch = SimpleConMatch { _arrow :: IsUnicodeSyntax
+                                     , _conPat :: Pat GhcPs
+                                     }
 
 data Default = Default {
   -- | Max number of underscores to show for the constructor of an alternative.
