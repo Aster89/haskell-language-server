@@ -442,10 +442,8 @@ caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 -- Refer to test cases to see practical examples.
 appendMissingPats :: Maybe Int -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
 appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
-  = let -- Chunkify the matches to be inserted,
-        missingGroup :| missingGroups = prettyChunksOf size missingMatches
-        -- and let all chunks have a common size, which is
-        size = case existingMatches of
+  = let -- Choose how many patterns per line we are emitting:
+        chunkSize = case existingMatches of
                  [] -> 1 -- trivially 1 if there's no existing matches,
                       -- otherwise, set the size equal to the length
                       -- of the last group of @existingMatches@ that
@@ -454,10 +452,13 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
                     $ NE.last
                     $ NE.groupBy1 startSameLine (NE.fromList existingMatches)
 
+        -- Chunkify the matches to be inserted:
+        missingGroup :| missingGroups = prettyChunksOf chunkSize missingMatches
+
         -- Detect if the list of alternatives is between @{@ and @}@:
         isBraced = isJust $ getOpeningBraceCol altsLoc
 
-        -- Finally, we lay out the missing matches:
+        -- Finally, lay out the missing matches:
         missingMatchesEP = -- indent the first group and the following ones (see discussion above)
                            mapFirst indentHead missingGroup :| map (mapFirst indentTail) missingGroups
                            -- add a semicolon to the end of each group only if the alternatives are braced
