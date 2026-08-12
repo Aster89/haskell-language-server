@@ -111,7 +111,7 @@ import           GHC.Types.SrcLoc                      (GenLocated (L),
                                                         combineSrcSpans)
 import           GHC.Types.Unique.SDFM                 (lookupUSDFM)
 import           Ide.Logger                            ((<+>))
-import           Ide.Plugin.Error                      (PluginError (PluginInternalError, PluginStaleResolve),
+import           Ide.Plugin.Error                      (PluginError (PluginInternalError),
                                                         getNormalizedFilePathE)
 import           Ide.PluginUtils                       (WithDeletions (IncludeDeletions),
                                                         diffText)
@@ -175,7 +175,8 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
           -> fileDiags
              -- pair each file diag with its ds messages, if any
              & map (id &&& getMaybeDsMsg)
-             -- discard those with 'Nothing' ds messages and unwrap the surviving 'Just's
+             -- discard those with 'Nothing' as @Maybe DsMessage@ and unwrap
+             -- the surviving 'Just's
              & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
              -- wrap back in the monad
              & pure
@@ -185,22 +186,24 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
           -> throwE $ PluginInternalError "This error should be converted to just return no action"
        | otherwise
           -> fileDiagAndDsMsg
+             -- extract the 'Diagnostic' and the pattern-match constructors for
+             -- each diag-and-message
+             & map (bimap fdLspDiagnostic dsMsgToPmAlts)
+             -- discard those with 'Nothing' as @Maybe [PmAltConApp]@ and
+             -- unwrap the surviving 'Just's
+             & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
              -- obtain the innermost diag-and-message
-             & minimumBy (ordSubrange `on` Diag._range . fdLspDiagnostic . fst)
-             -- extract the 'Diagnostic' and the pattern-match constructors
-             & bimap fdLspDiagnostic dsMsgToPmAlts
+             & minimumBy (ordSubrange `on` Diag._range . fst)
              & pure
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
   arrowSyntax <- getArrowSyntax state nfp
 
-  if | Nothing <- pmAltsConApps
-          -> throwE PluginStaleResolve
-     | Just [] <- pmAltsConApps
+  if | null pmAltsConApps
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
      | -- encode the information that there's more than one construtor
-       Just (NE.fromList -> pmAltsConApps) <- pmAltsConApps
+       (NE.fromList -> pmAltsConApps) <- pmAltsConApps
        -- TODO: update doc
        -- determine old and new text of the module
      , let psOld = pm_parsed_source pm
