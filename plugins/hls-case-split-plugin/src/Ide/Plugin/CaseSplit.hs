@@ -28,12 +28,11 @@ import           Data.Bifunctor                        (bimap)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
-import           Data.List                             (minimumBy)
 import           Data.List.Extra                       (chunksOf, dropEnd,
                                                         takeEnd)
 import           Data.List.NonEmpty                    (NonEmpty ((:|)), nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
-import           Data.List.NonEmpty.Extra              ((|:))
+import           Data.List.NonEmpty.Extra              ((|:), minimumBy1)
 import           Data.Maybe                            (isJust, listToMaybe,
                                                         mapMaybe)
 import           Data.Text                             (Text)
@@ -215,6 +214,7 @@ attachDsMessages (Just fileDiags) = fileDiags
 extractDiagAndPmAltsConApps :: [(FileDiagnostic, DsMessage)] -> Maybe (Diag.Diagnostic, NonEmpty PmAltConApp)
 extractDiagAndPmAltsConApps [] = Nothing
 extractDiagAndPmAltsConApps fileDiagAndDsMsg =
+  -- TODO: update doc
   fileDiagAndDsMsg -- extract the 'Diagnostic' and the pattern-match constructors for
                    -- each diag-and-message, only retaining those with some constructor
                    & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> nonEmpty))
