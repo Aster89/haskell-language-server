@@ -14,8 +14,7 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
-import           Control.Applicative                   (ZipList (ZipList, getZipList),
-                                                        (<|>))
+import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
 import           Control.Monad                         (mzero)
@@ -336,9 +335,9 @@ getMatchGroup (LambdaCase _ mg) = mg
 --      - the input `HsExpr GhcPs` information, but wrapped in the refined
 --        type 'CaseOrLamCase',
 --      - the 'SrcSpan' the parsed expression occupies,
---      - the indentation of the first existing match (see also
---        'getIndentation').
-parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (CaseOrLamCase, SrcSpan, Maybe Int)
+--      - the information for correctly indenting the matches to be inserted
+--        (see also 'MatchLayout').
+parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (CaseOrLamCase, SrcSpan, MatchLayout)
 
 parseCaseLikeExpr (HsCase ext scrut ps)
   | EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
@@ -347,7 +346,7 @@ parseCaseLikeExpr (HsCase ext scrut ps)
   , MG _ (L (EpAnn endTok _ _) _) <- ps
   , let endSSpan = getHasLoc endTok
         span = caseExprSpan caseSSpan ofSSpan endSSpan
-  = Just (Case ext scrut ps, span, getIndentation ps)
+  = Just (Case ext scrut ps, span, getMatchesLayout ps)
 
 parseCaseLikeExpr (HsLam ext LamCase ps)
   | EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
@@ -356,27 +355,34 @@ parseCaseLikeExpr (HsLam ext LamCase ps)
   , MG _ (L (EpAnn endTok _ _) _) <- ps
   , let endSSpan = getHasLoc endTok
         span = caseExprSpan backslashSSpan caseSSpan endSSpan
-  = Just (LambdaCase ext ps, span, getIndentation ps)
+  = Just (LambdaCase ext ps, span, getMatchesLayout ps)
 
 parseCaseLikeExpr _ = Nothing
 
--- | Given a 'MatchGroup', this function returns
+-- | Isomorphic to @Maybe Matches@, this type encodes whether a @case@-like
+-- expression has braces; in the positive case, it also records whether there's
+-- pre-existing matches.
 --
---     - 'Nothing' if the matches are not braced,
+-- See also 'Matches'.
+data MatchLayout = Braced Matches | NonBraced
+
+-- | Isomorphic to @Maybe Int@, this type encodes whether there's pre-existing
+-- matches in a @case@-like expression **with braces**, and - in the positive
+-- case - what's the indentation of the first of them.
 --
---     - @Just i@ if the matches are braced, being @i@ equal to
---
---         - @indentation def@ when there's no matches,
---
---         - otherwise, the indentation of the first alternative with respect
---           to the @{@.
---
-getIndentation :: MatchGroup GhcPs (LHsExpr GhcPs) -> Maybe Int
-getIndentation (MG { mg_alts = L altsLoc existingMatches })
-  = do openingBraceCol <- getOpeningBraceCol altsLoc
-       let fstExistingIndent = do fstExistingCol <- getStartCol <$> listToMaybe existingMatches
-                                  Just (fstExistingCol - openingBraceCol)
-       fstExistingIndent <|> Just (indentation def)
+-- Note: it could also model the same concept for the non-braced case, but that's
+-- not needed (see also 'MatchLayout').
+data Matches = NoMatches | SomeMatches Int
+
+-- | Given a 'MatchGroup', this function returns its 'MatchLayout'.
+getMatchesLayout :: MatchGroup GhcPs (LHsExpr GhcPs) -> MatchLayout
+getMatchesLayout (MG { mg_alts = L altsLoc existingMatches })
+  = case (getOpeningBraceCol altsLoc, getStartCol <$> listToMaybe existingMatches) of
+      (Nothing, _) -> NonBraced
+      (_, Nothing) -> Braced NoMatches
+      (Just openingBraceCol, Just fstExistingMatchCol)
+        -> let indent = fstExistingMatchCol - openingBraceCol
+           in Braced $ SomeMatches indent
 
 -- | Given a @case@ or @\case@ expression wrapped in our refined
 -- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
@@ -441,8 +447,8 @@ caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 --
 --
 -- Refer to test cases to see practical examples.
-appendMissingPats :: Maybe Int -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
-appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
+appendMissingPats :: MatchLayout -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
+appendMissingPats matchLayout mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
   = let -- Choose how many patterns per line we are emitting:
         chunkSize = case existingMatches of
                  [] -> 1 -- trivially 1 if there's no existing matches,
@@ -494,13 +500,12 @@ appendMissingPats mayIndent mg@(MG { mg_alts = L altsLoc existingMatches }) miss
             -- Therefore, here's how we set the DeltaPos for the first and
             -- following matches:
             (setDPCol -> indentHead, setDPCol -> indentTail)
-               = case mayIndent of
-                   -- non-braced with some existing matches
-                   Nothing | null existingMatches -> (indentation def, 0)
-                   -- non-braced without existing matches
-                   Nothing                        -> (0, 0)
-                   -- braced
-                   Just i                         -> (i, i)
+               = case matchLayout of
+                   NonBraced | null existingMatches  -> (indentation def, 0)
+                   NonBraced                         -> (0, 0)
+                   Braced (SomeMatches indent)       -> (indent, indent)
+                   Braced NoMatches                  -> let indent = indentation def
+                                                        in (indent, indent)
 
         -- Only if there's braces do we need to make sure the last of the
         -- existing matches ends with @;@:
