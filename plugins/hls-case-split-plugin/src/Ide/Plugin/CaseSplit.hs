@@ -217,7 +217,7 @@ extractDiagAndPmAltsConApps fileDiagAndDsMsg =
   -- TODO: update doc
   fileDiagAndDsMsg -- extract the 'Diagnostic' and the pattern-match constructors for
                    -- each diag-and-message, only retaining those with some constructor
-                   & map (bimap fdLspDiagnostic (dsMsgToPmAlts >=> nonEmpty))
+                   & map (bimap fdLspDiagnostic (getMissingCtors >=> nonEmpty))
                    -- discard those with 'Nothing' as alternatives and
                    -- unwrap the surviving 'Just's
                    & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
@@ -225,8 +225,8 @@ extractDiagAndPmAltsConApps fileDiagAndDsMsg =
                    -- obtain the innermost diag-and-message
                    & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
   where
-    dsMsgToPmAlts :: DsMessage -> Maybe [PmAltConApp]
-    dsMsgToPmAlts =
+    getMissingCtors :: DsMessage -> Maybe [PmAltConApp]
+    getMissingCtors =
       \case DsNonExhaustivePatterns CaseAlt _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             DsNonExhaustivePatterns (LamAlt LamCase) _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             _ -> Nothing
