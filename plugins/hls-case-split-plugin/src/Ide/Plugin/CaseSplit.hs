@@ -153,10 +153,10 @@ import Data.Semigroup (sconcat)
   The present plugin achieves its target of inserting the missing patterns to a
   non-exhaustive @case@ (or @\case@) expression via the following strategy:
 
-    1. retrieve all the diagnostics under the cursor
+    1. retrieve all the diagnostics under the cursor,
 
-    2. retain only the innermost diagnostic relative to non-exhaustive patterns
-       (several can be nested, in general)
+    2. extract the missing patterns from the innermost "non-exhaustive
+       patterns" diagnostic (several can be nested, in general),
 
     3. determine whether @->@ or @→@ should be used
 
@@ -189,32 +189,32 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   let diagAndPmAltsConApps = getInnermost $ extractDiagAndMissingCtors fileDiags
 
-  pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
-
-  arrowSyntax <- getArrowSyntax state nfp
-
   if | Nothing <- diagAndPmAltsConApps
           -> pure $ InL [] -- This happens when the type of the expression is unknown.
      | -- encode the information that there's more than one construtor
        Just (diag, pmAltsConApps) <- diagAndPmAltsConApps
        -- TODO: update doc
        -- determine old and new text of the module
-     , let psOld = pm_parsed_source pm
-     , Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
-          -> do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
-                edit <- makeEditText verTxtDocId psOld psNew
-                -- return the action
-                pure $ InL [InR
-                  $ CodeAction { _title       = caseSplitPluginCodeActionTitle
-                               , _kind        = Just CodeActionKind_QuickFix
-                               , _diagnostics = Just [diag]
-                               , _isPreferred = Nothing
-                               , _disabled    = Nothing
-                               , _edit        = Just edit
-                               , _command     = Nothing
-                               , _data_       = Nothing }]
-     | otherwise
-          -> throwE $ PluginInternalError "Error in updating the AST."
+          -> do pm <- runActionE "CaseSplit.GetParsedModule"
+                                 state
+                                 (useE GetParsedModule nfp)
+                arrowSyntax <- getArrowSyntax state nfp
+                if | let psOld = pm_parsed_source pm
+                   , Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
+                        -> do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+                              edit <- makeEditText verTxtDocId psOld psNew
+                              -- return the action
+                              pure $ InL [InR
+                                $ CodeAction { _title       = caseSplitPluginCodeActionTitle
+                                             , _kind        = Just CodeActionKind_QuickFix
+                                             , _diagnostics = Just [diag]
+                                             , _isPreferred = Nothing
+                                             , _disabled    = Nothing
+                                             , _edit        = Just edit
+                                             , _command     = Nothing
+                                             , _data_       = Nothing }]
+                   | otherwise
+                        -> throwE $ PluginInternalError "Error in updating the AST."
 
 extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, NonEmpty PmAltConApp)]
 extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
