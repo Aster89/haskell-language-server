@@ -59,7 +59,7 @@ import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
                                                         HsMatchContext (CaseAlt),
                                                         HscEnv (hsc_dflags), Id,
                                                         NamedThing (getName),
-                                                        getLoc, DataCon, RdrName)
+                                                        getLoc)
 import           Development.IDE.GHC.Compat.Core       (AnnListItem,
                                                         EpAnnHsCase (EpAnnHsCase),
                                                         GrhsAnn (..),
@@ -96,7 +96,7 @@ import           GHC.Hs                                (DeltaPos (deltaColumn),
                                                         HsRecFields (HsRecFields),
                                                         XCase, XLam, deltaPos,
                                                         getDeltaLine,
-                                                        unnamedHoleRdrName, SrcSpanAnnN)
+                                                        unnamedHoleRdrName)
 import           GHC.HsToCore.Pmc.Solver.Types         (Nabla (nabla_tm_st),
                                                         PmAltCon (..),
                                                         PmAltConApp (..),
@@ -302,21 +302,21 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
                -- parse @case@-like expressions, and extract the 'SrcSpan' the
                -- whole expression occupies, as well as the indentation of the
                -- first alternative (see 'parseCaseLikeExpr' for more details),
-             , Just (caseLikeNode, span, indent) <- parseCaseLikeExpr node
+             , Just (CaseLike {..}) <- parseCaseLikeExpr node
                -- make sure the cursor is somewhere in that span,
-             , cursor `inSpan` span
+             , cursor `inSpan` _span
                -> do -- take note we've found the node,
                      put True
                      -- make a match out of each missing pattern,
                      let missingPs' = traverse (makeMatch arrowSyntax) missingPs
                      -- extract existing matches
-                     let existingMatches = getMatchGroup caseLikeNode
+                     let existingMatches = getMatchGroup _expr
                      -- and append the missing to ones to them.
-                     case appendMissingPats indent existingMatches =<< missingPs' of
+                     case appendMissingPats _layout existingMatches =<< missingPs' of
                         -- If something goes wrong, we communicate abortion,
                         Nothing      -> mzero
                         -- otherwise we continue.
-                        Just newPats -> pure $ setMatches caseLikeNode newPats
+                        Just newPats -> pure $ setMatches _expr newPats
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
 
@@ -324,13 +324,18 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
       inSpan :: Range -> SrcSpan -> Bool
       inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
+data CaseLike = CaseLike { _expr :: CaseLikeExpr
+                         , _span :: SrcSpan
+                         , _layout :: MatchLayout
+                         }
+
 -- | While @HsExpr GhcPs@ can contain any expression, the following refined
 -- type can only contain a @case@ or a @\case@ expression.
-data CaseOrLamCase = Case (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
-                   | LambdaCase (XLam GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
+data CaseLikeExpr = Case       (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
+                  | LambdaCase (XLam  GhcPs)                 (MatchGroup GhcPs (LHsExpr GhcPs))
 
 -- | Get the 'MatchGroup' out of a 'CaseOrLamCase'.
-getMatchGroup :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs)
+getMatchGroup :: CaseLikeExpr -> MatchGroup GhcPs (LHsExpr GhcPs)
 getMatchGroup (Case _ _ mg)     = mg
 getMatchGroup (LambdaCase _ mg) = mg
 
@@ -342,25 +347,31 @@ getMatchGroup (LambdaCase _ mg) = mg
 --      - the 'SrcSpan' the parsed expression occupies,
 --      - the information for correctly indenting the matches to be inserted
 --        (see also 'MatchLayout').
-parseCaseLikeExpr :: HsExpr GhcPs -> Maybe (CaseOrLamCase, SrcSpan, MatchLayout)
+parseCaseLikeExpr :: HsExpr GhcPs -> Maybe CaseLike
 
-parseCaseLikeExpr (HsCase ext scrut ps)
+parseCaseLikeExpr (HsCase ext scrut matchGroup)
   | EpAnnHsCase (EpTok caseTok) (EpTok ofTok) <- ext
   , let caseSSpan = getHasLoc caseTok
         ofSSpan = getHasLoc ofTok
-  , MG _ (L (EpAnn endTok _ _) _) <- ps
+  , MG _ (L (EpAnn endTok _ _) _) <- matchGroup
   , let endSSpan = getHasLoc endTok
         span = caseExprSpan caseSSpan ofSSpan endSSpan
-  = Just (Case ext scrut ps, span, getMatchesLayout ps)
+  = Just $ CaseLike { _expr = Case ext scrut matchGroup
+                    , _span = span
+                    , _layout = getMatchesLayout matchGroup
+                    }
 
-parseCaseLikeExpr (HsLam ext LamCase ps)
+parseCaseLikeExpr (HsLam ext LamCase matchGroup)
   | EpAnnLam (EpTok backslashTok) (Just caseTok) <- ext
   , let backslashSSpan = getHasLoc backslashTok
         caseSSpan = getHasLoc caseTok
-  , MG _ (L (EpAnn endTok _ _) _) <- ps
+  , MG _ (L (EpAnn endTok _ _) _) <- matchGroup
   , let endSSpan = getHasLoc endTok
         span = caseExprSpan backslashSSpan caseSSpan endSSpan
-  = Just (LambdaCase ext ps, span, getMatchesLayout ps)
+  = Just $ CaseLike { _expr = LambdaCase ext matchGroup
+                    , _span = span
+                    , _layout = getMatchesLayout matchGroup
+                    }
 
 parseCaseLikeExpr _ = Nothing
 
@@ -392,7 +403,7 @@ getMatchesLayout (MG { mg_alts = L altsLoc existingMatches })
 -- | Given a @case@ or @\case@ expression wrapped in our refined
 -- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
 -- @HsExpr GhcPs@ with that 'MatchGroup' in it.
-setMatches :: CaseOrLamCase -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
+setMatches :: CaseLikeExpr -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
 setMatches (Case x s _) mg     = HsCase x s mg
 setMatches (LambdaCase x _) mg = HsLam x LamCase mg
 
@@ -482,11 +493,11 @@ appendMissingPats matchLayout mg@(MG { mg_alts = L altsLoc existingMatches }) mi
                            -- turn into an ordinary list
                          & NE.toList
           where
-            -- add semicolons
+            -- add semicolons:
             addSemicols = NE.zipWith ($)
                                       -- for each one-line group of matches,
                                      (replicate (length missingGroups)
-                                                -- only to the last match of the group
+                                                -- only to the last match of the group,
                                                 (mapLast addSemiCol)
                                       -- except for the last group
                                       |: id)
@@ -540,8 +551,9 @@ prettyChunksOf size allMatches = do
     toZipList = ZipList . NE.toList
     fromZipList = NE.fromList . getZipList
 
--- | Given a 'PmAltConApp', this function produces an 'LMatch' to be inserted
--- in the list of existing 'LMatch'es contained by a 'MatchGroup'.
+-- | Given a 'IsUnicodeSyntax', describing whether to use @->@ or @→@, and a
+-- 'PmAltConApp', this function produces an 'LMatch' to be inserted in the list
+-- of existing 'LMatch'es contained by a 'MatchGroup'.
 --
 -- The returned 'LMatch' is wrapped in 'Maybe' to account for failure, and it
 -- is constructed in its entirety, by passing "default" values wherever
@@ -550,12 +562,6 @@ prettyChunksOf size allMatches = do
 --  - the constructor name,
 --  - the arguments to the constructor, all rendered as individual underscores
 --    when there's less than @maxUnderscores def@, or as a single @{}@ otherwise.
---
--- As regards the monad transformers,
---
--- The first argument of type 'UnicodeSyntax' simply contains the symbol used
--- for the arrow, which can be @->@ or @→@ depending on whether the 'UnicodeSyntax'
--- language extension is being used.
 makeMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe (LMatch GhcPs (LHsExpr GhcPs))
 makeMatch arrow pmAltConApp = makeLMatch <$> parseSimpleConMatch arrow pmAltConApp
 
