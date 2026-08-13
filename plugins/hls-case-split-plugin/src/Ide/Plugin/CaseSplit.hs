@@ -181,7 +181,6 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
   fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
   case getInnermost $ extractDiagAndMissingCtors fileDiags of
-
     Nothing
       -> pure $ InL [] -- This happens when the type of the expression is unknown.
      -- encode the information that there's more than one construtor
