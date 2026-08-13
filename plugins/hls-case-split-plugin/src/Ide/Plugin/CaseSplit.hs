@@ -26,7 +26,7 @@ import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
 import           Control.Monad.Trans                   (lift)
-import           Control.Monad.Trans.Except            (throwE, ExceptT)
+import           Control.Monad.Trans.Except            (ExceptT)
 import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
@@ -52,7 +52,6 @@ import           Development.IDE                       (FileDiagnostic (fdStruct
 import           Development.IDE.Core.FileStore        (getVersionedTextDoc)
 import           Development.IDE.Core.PluginUtils      (activeDiagnosticsInRange,
                                                         runActionE, useE)
-import qualified Development.IDE.Core.Shake            as Shake
 import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
                                                         HoleKind (HoleVar),
                                                         HsMatchContext (CaseAlt),
@@ -112,9 +111,8 @@ import           GHC.Types.SrcLoc                      (GenLocated (L),
                                                         SrcSpan (RealSrcSpan),
                                                         combineSrcSpans)
 import           GHC.Types.Unique.SDFM                 (lookupUSDFM)
-import           Ide.Logger                            ((<+>))
-import           Ide.Plugin.Error                      (PluginError (PluginInternalError),
-                                                        getNormalizedFilePathE)
+import           Ide.Logger                            (logWith, Priority (Error))
+import           Ide.Plugin.Error                      (getNormalizedFilePathE, PluginError)
 import           Ide.PluginUtils                       (WithDeletions (IncludeDeletions),
                                                         diffText)
 import           Ide.Types                             (PluginDescriptor (pluginHandlers),
@@ -165,31 +163,25 @@ import Data.Semigroup (sconcat)
 -}
 
 data Log where
-  LogShake :: Shake.Log -> Log
-  LogWAEResponseError :: LSP.TResponseError LSP.Method_WorkspaceApplyEdit -> Log
-  LogResolve :: Pretty a => a -> Log
+  LogASTUpdateError :: Log
 
 instance Pretty Log where
-  pretty = \case
-    LogShake logMsg -> "LogShake " <+> pretty logMsg
-    LogWAEResponseError rspErr -> "RequestWorkspaceApplyEdit Failed with " <+> pretty rspErr
-    LogResolve msg -> "LogResolve " <+> pretty msg
+  pretty LogASTUpdateError = "Error in updating the AST."
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
-descriptor _ plId = (defaultPluginDescriptor plId "Provides the split case code action")
-  { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction suggestCaseSplitProvider
+descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split case code action")
+  { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction (suggestCaseSplitProvider recorder)
   }
 
-suggestCaseSplitProvider :: PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
-suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = cursor } = do
+suggestCaseSplitProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
+suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _range = cursor } = do
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
   fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  let diagAndPmAltsConApps = getInnermost $ extractDiagAndMissingCtors fileDiags
+  case getInnermost $ extractDiagAndMissingCtors fileDiags of
 
-  case diagAndPmAltsConApps of
     Nothing
       -> pure $ InL [] -- This happens when the type of the expression is unknown.
      -- encode the information that there's more than one construtor
@@ -205,7 +197,8 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
                    -> do codeAction <- makeCodeAction state _textDocument diag psOld psNew
                          pure $ InL [InR codeAction]
                | otherwise
-                   -> throwE $ PluginInternalError "Error in updating the AST."
+                   -> do logWith recorder Error LogASTUpdateError
+                         pure $ InL []
 
 makeCodeAction :: IdeState -> TextDocumentIdentifier -> Diagnostic -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) CodeAction
 makeCodeAction state _textDocument diag psOld psNew
@@ -326,16 +319,16 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
              , cursor `inSpan` _span
                -> do -- take note we've found the node,
                      put True
-                     -- make a match out of each missing pattern,
-                     let missingPs' = traverse (makeMatch arrowSyntax) missingPs
                      -- extract existing matches
                      let existingMatches = getMatchGroup _expr
-                     -- and append the missing to ones to them.
-                     case appendMissingPats _layout existingMatches =<< missingPs' of
+                     -- make a match out of each missing pattern,
+                     case traverse (makeMatch arrowSyntax) missingPs of
                         -- If something goes wrong, we communicate abortion,
-                        Nothing      -> mzero
+                        Nothing             -> mzero
                         -- otherwise we continue.
-                        Just newPats -> pure $ setMatches _expr newPats
+                        Just missingMatches -> pure
+                                             $ setMatches _expr
+                                             $ appendMissingPats _layout existingMatches missingMatches
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
 
@@ -482,7 +475,10 @@ caseExprSpan caseSSpan ofSSpan _ = combineSrcSpans caseSSpan ofSSpan
 --
 --
 -- Refer to test cases to see practical examples.
-appendMissingPats :: MatchLayout -> MatchGroup GhcPs (LHsExpr GhcPs) -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs)) -> Maybe (MatchGroup GhcPs (LHsExpr GhcPs))
+appendMissingPats :: MatchLayout
+                  -> MatchGroup GhcPs (LHsExpr GhcPs)
+                  -> NonEmpty (LMatch GhcPs (LHsExpr GhcPs))
+                  -> MatchGroup GhcPs (LHsExpr GhcPs)
 appendMissingPats matchLayout mg@(MG { mg_alts = L altsLoc existingMatches }) missingMatches
   = let -- Choose how many patterns per line we are emitting:
         chunkSize = case existingMatches of
@@ -548,7 +544,7 @@ appendMissingPats matchLayout mg@(MG { mg_alts = L altsLoc existingMatches }) mi
                                then dropEnd 1 existingMatches <> (addSemiCol <$> takeEnd 1 existingMatches)
                                else existingMatches
 
-    in Just $ mg { mg_alts = L altsLoc (existingMatchesEP <> missingMatchesEP) }
+    in mg { mg_alts = L altsLoc (existingMatchesEP <> missingMatchesEP) }
 
 -- | Accepts a @NonEmpty (LocatedAn AnnListItem a)@ and chunkifies it by the given 'size',
 -- putting all matches of each chunk on the same line, leaving 1 space in between, and
