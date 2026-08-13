@@ -138,12 +138,13 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier, Command)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
 import Data.Semigroup (sconcat)
+import GHC.Utils.Monad (concatMapM)
 
 
 {- Note [Implementation strategy]
@@ -151,12 +152,13 @@ import Data.Semigroup (sconcat)
   The present plugin achieves its target of inserting the missing patterns to a
   non-exhaustive @case@ (or @\case@) expression via the following strategy:
 
-    1. retrieve all the diagnostics under the cursor,
+    1. retrieve the '[FileDiagnostic]' under the cursor,
 
-    2. extract the missing patterns from the innermost "non-exhaustive
-       patterns" diagnostic (several can be nested, in general),
+    2. extract the 'Diagnostic' and the 'NonEmpty' list of missing
+       'PmAltConApp' from the innermost "non-exhaustive patterns" diagnostic
+       (several can be nested, in general),
 
-    3. determine whether @->@ or @→@ should be used
+    3. craft a 'CodeAction' 
 
     4. 
 
@@ -180,40 +182,44 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  case getInnermost $ extractDiagAndMissingCtors fileDiags of
-    Nothing
-      -> pure $ InL [] -- This happens when the type of the expression is unknown.
-     -- encode the information that there's more than one construtor
-    Just (diag, pmAltsConApps)
+  let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
+
+  codeAction <- concatMapM (makeCodeActions nfp) diagAndMissingCtors
+
+  pure $ InL $ InR <$> codeAction
+
+  where
+    makeCodeActions :: NormalizedFilePath -> (Diagnostic, MissingPatterns) -> ExceptT PluginError (HandlerM Config) [CodeAction]
+    makeCodeActions nfp (diag, pmAltsConApps)
       -- TODO: update doc
       -- determine old and new text of the module
-      -> do arrowSyntax <- getArrowSyntax state nfp
+       = do arrowSyntax <- getArrowSyntax state nfp
             psOld <- pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
                                                      state
                                                      (useE GetParsedModule nfp)
 
             if | Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
-                   -> do codeAction <- makeCodeAction state _textDocument diag psOld psNew
-                         pure $ InL [InR codeAction]
+                   -> do edit <- makeWorkspaceEdit state _textDocument psOld psNew
+                         pure $ [makeCodeAction diag edit]
                | otherwise
                    -> do logWith recorder Error LogASTUpdateError
-                         pure $ InL []
+                         pure $ []
 
-makeCodeAction :: IdeState -> TextDocumentIdentifier -> Diagnostic -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) CodeAction
-makeCodeAction state _textDocument diag psOld psNew
+makeWorkspaceEdit :: IdeState -> TextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
+makeWorkspaceEdit state _textDocument psOld psNew
   = do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
-       edit <- makeEditText verTxtDocId psOld psNew
-       pure $ make diag edit
-  where
-    make :: Diagnostic -> WorkspaceEdit -> CodeAction
-    make diag edit = CodeAction { _title       = caseSplitPluginCodeActionTitle
-                                , _kind        = Just CodeActionKind_QuickFix
-                                , _diagnostics = Just [diag] -- TODO: is this really important? What if I just put Nothing?
-                                , _isPreferred = Nothing
-                                , _disabled    = Nothing
-                                , _edit        = Just edit
-                                , _command     = Nothing
-                                , _data_       = Nothing }
+       makeEditText verTxtDocId psOld psNew
+
+makeCodeAction :: Diagnostic -> WorkspaceEdit -> CodeAction
+makeCodeAction diag edit
+  = CodeAction { _title       = caseSplitPluginCodeActionTitle
+               , _kind        = Just CodeActionKind_QuickFix
+               , _diagnostics = Just [diag] -- TODO: is this really important? What if I just put Nothing?
+               , _isPreferred = Nothing
+               , _disabled    = Nothing
+               , _edit        = Just edit
+               , _command     = Nothing
+               , _data_       = Nothing }
 
 makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
 makeEditText verTxtDocId psOld psNew = do
