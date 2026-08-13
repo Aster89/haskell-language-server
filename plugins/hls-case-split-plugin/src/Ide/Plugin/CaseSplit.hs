@@ -21,7 +21,7 @@ module Ide.Plugin.CaseSplit
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
-import           Control.Monad                         (mzero, (>=>))
+import           Control.Monad                         (mzero, (>=>), when)
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
@@ -37,7 +37,7 @@ import           Data.List.NonEmpty                    (NonEmpty ((:|)), nonEmpt
 import qualified Data.List.NonEmpty                    as NE
 import           Data.List.NonEmpty.Extra              ((|:), minimumBy1)
 import           Data.Maybe                            (isJust, listToMaybe,
-                                                        mapMaybe)
+                                                        mapMaybe, maybeToList, isNothing)
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
 import           Development.IDE                       (FileDiagnostic (fdStructuredMessage),
@@ -138,13 +138,13 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier, Command)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
 import Data.Semigroup (sconcat)
-import GHC.Utils.Monad (concatMapM)
+import Data.Foldable.Extra (firstJustM)
 
 
 {- Note [Implementation strategy]
@@ -158,9 +158,7 @@ import GHC.Utils.Monad (concatMapM)
        'PmAltConApp' from the innermost "non-exhaustive patterns" diagnostic
        (several can be nested, in general),
 
-    3. craft a 'CodeAction' 
-
-    4. 
+    3. craft a 'CodeAction' and return it.
 
 -}
 
@@ -184,12 +182,15 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
 
-  codeAction <- concatMapM (makeCodeActions nfp) diagAndMissingCtors
+  codeAction <- firstJustM (makeCodeActions nfp) diagAndMissingCtors
 
-  pure $ InL $ InR <$> codeAction
+  when (isNothing codeAction)
+    $ logWith recorder Error LogASTUpdateError
+
+  pure $ InL $ InR <$> maybeToList codeAction
 
   where
-    makeCodeActions :: NormalizedFilePath -> (Diagnostic, MissingPatterns) -> ExceptT PluginError (HandlerM Config) [CodeAction]
+    makeCodeActions :: NormalizedFilePath -> (Diagnostic, MissingPatterns) -> ExceptT PluginError (HandlerM Config) (Maybe CodeAction)
     makeCodeActions nfp (diag, pmAltsConApps)
       -- TODO: update doc
       -- determine old and new text of the module
@@ -200,10 +201,10 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
             if | Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
                    -> do edit <- makeWorkspaceEdit state _textDocument psOld psNew
-                         pure $ [makeCodeAction diag edit]
+                         pure $ Just $ makeCodeAction diag edit
                | otherwise
                    -> do logWith recorder Error LogASTUpdateError
-                         pure $ []
+                         pure $ Nothing
 
 makeWorkspaceEdit :: IdeState -> TextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
 makeWorkspaceEdit state _textDocument psOld psNew
