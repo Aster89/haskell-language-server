@@ -140,7 +140,7 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
@@ -189,32 +189,53 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   let diagAndPmAltsConApps = getInnermost $ extractDiagAndMissingCtors fileDiags
 
-  if | Nothing <- diagAndPmAltsConApps
-          -> pure $ InL [] -- This happens when the type of the expression is unknown.
-     | -- encode the information that there's more than one construtor
-       Just (diag, pmAltsConApps) <- diagAndPmAltsConApps
-       -- TODO: update doc
-       -- determine old and new text of the module
-          -> do pm <- runActionE "CaseSplit.GetParsedModule"
-                                 state
-                                 (useE GetParsedModule nfp)
-                arrowSyntax <- getArrowSyntax state nfp
-                if | let psOld = pm_parsed_source pm
-                   , Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
-                        -> do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
-                              edit <- makeEditText verTxtDocId psOld psNew
-                              -- return the action
-                              pure $ InL [InR
-                                $ CodeAction { _title       = caseSplitPluginCodeActionTitle
-                                             , _kind        = Just CodeActionKind_QuickFix
-                                             , _diagnostics = Just [diag]
-                                             , _isPreferred = Nothing
-                                             , _disabled    = Nothing
-                                             , _edit        = Just edit
-                                             , _command     = Nothing
-                                             , _data_       = Nothing }]
-                   | otherwise
-                        -> throwE $ PluginInternalError "Error in updating the AST."
+  case diagAndPmAltsConApps of
+    Nothing
+      -> pure $ InL [] -- This happens when the type of the expression is unknown.
+     -- encode the information that there's more than one construtor
+    Just (diag, pmAltsConApps)
+      -- TODO: update doc
+      -- determine old and new text of the module
+      -> do arrowSyntax <- getArrowSyntax state nfp
+            psOld <- pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
+                                                     state
+                                                     (useE GetParsedModule nfp)
+
+            if | Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
+                   -> do codeAction <- makeCodeAction state _textDocument diag psOld psNew
+                         pure $ InL [InR codeAction]
+               | otherwise
+                   -> throwE $ PluginInternalError "Error in updating the AST."
+
+makeCodeAction :: IdeState -> TextDocumentIdentifier -> Diagnostic -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) CodeAction
+makeCodeAction state _textDocument diag psOld psNew
+  = do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+       edit <- makeEditText verTxtDocId psOld psNew
+       pure $ make diag edit
+  where
+    make :: Diagnostic -> WorkspaceEdit -> CodeAction
+    make diag edit = CodeAction { _title       = caseSplitPluginCodeActionTitle
+                                , _kind        = Just CodeActionKind_QuickFix
+                                , _diagnostics = Just [diag] -- TODO: is this really important? What if I just put Nothing?
+                                , _isPreferred = Nothing
+                                , _disabled    = Nothing
+                                , _edit        = Just edit
+                                , _command     = Nothing
+                                , _data_       = Nothing }
+
+makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
+makeEditText verTxtDocId psOld psNew = do
+  let old = T.pack $ exactPrint psOld
+  let new = T.pack $ exactPrint psNew
+  caps <- lift pluginGetClientCapabilities
+  pure $ diffText caps (verTxtDocId, old) new IncludeDeletions
+
+getArrowSyntax :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) IsUnicodeSyntax
+getArrowSyntax state nfp = do
+  (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
+  pure $ if On Ext.UnicodeSyntax `elem` extensions dynFlags
+    then UnicodeSyntax
+    else NormalSyntax
 
 extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, NonEmpty PmAltConApp)]
 extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
@@ -246,20 +267,6 @@ getInnermost fileDiagAndDsMsg =
   fileDiagAndDsMsg & nonEmpty
                    -- obtain the innermost diag-and-message
                    & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
-
-makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
-makeEditText verTxtDocId psOld psNew = do
-  let old = T.pack $ exactPrint psOld
-  let new = T.pack $ exactPrint psNew
-  caps <- lift pluginGetClientCapabilities
-  pure $ diffText caps (verTxtDocId, old) new IncludeDeletions
-
-getArrowSyntax :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) IsUnicodeSyntax
-getArrowSyntax state nfp = do
-  (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
-  pure $ if On Ext.UnicodeSyntax `elem` extensions dynFlags
-    then UnicodeSyntax
-    else NormalSyntax
 
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
