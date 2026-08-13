@@ -28,7 +28,6 @@ import           Control.Monad.State.Strict            (MonadState (get, put),
 import           Control.Monad.Trans                   (lift)
 import           Control.Monad.Trans.Except            (throwE, ExceptT)
 import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
-import           Data.Bifunctor                        (bimap)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
@@ -141,12 +140,29 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
 import Data.Semigroup (sconcat)
+
+
+{- Note [Implementation strategy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  The present plugin achieves its target of inserting the missing patterns to a
+  non-exhaustive @case@ (or @\case@) expression via the following strategy:
+
+    1. retrieve all the diagnostics under the cursor
+
+    2. retain only the innermost diagnostic relative to non-exhaustive patterns
+       (several can be nested, in general)
+
+    3. determine whether @->@ or @→@ should be used
+
+    4. 
+
+-}
 
 data Log where
   LogShake :: Shake.Log -> Log
@@ -169,11 +185,9 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
-  fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
+  fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  let fileDiagAndDsMsg = attachDsMessages fileDiags
-
-  let diagAndPmAltsConApps = extractDiagAndPmAltsConApps fileDiagAndDsMsg
+  let diagAndPmAltsConApps = getInnermost $ extractDiagAndMissingCtors fileDiags
 
   pm <- runActionE "CaseSplit.GetParsedModule" state $ useE GetParsedModule nfp
 
@@ -202,38 +216,36 @@ suggestCaseSplitProvider state _ CodeActionParams{ _textDocument, _range = curso
      | otherwise
           -> throwE $ PluginInternalError "Error in updating the AST."
 
-attachDsMessages :: Maybe [FileDiagnostic] -> [(FileDiagnostic, DsMessage)]
-attachDsMessages (Just []; Nothing) = []
-attachDsMessages (Just fileDiags) = fileDiags
-                                  -- pair each file diag with its ds messages, if any
-                                  & map (id &&& getMaybeDsMsg)
-                                  -- discard those with 'Nothing' as messages and unwrap
-                                  -- the surviving 'Just's
-                                  & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-                                  -- wrap back in the monad
-  where
-    getMaybeDsMsg :: FileDiagnostic -> Maybe DsMessage
-    getMaybeDsMsg d = fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage
-
-extractDiagAndPmAltsConApps :: [(FileDiagnostic, DsMessage)] -> Maybe (Diag.Diagnostic, NonEmpty PmAltConApp)
-extractDiagAndPmAltsConApps [] = Nothing
-extractDiagAndPmAltsConApps fileDiagAndDsMsg =
-  -- TODO: update doc
-  fileDiagAndDsMsg -- extract the 'Diagnostic' and the pattern-match constructors for
+extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, NonEmpty PmAltConApp)]
+extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
+                   map (fdLspDiagnostic &&& (getDsMessage >=> getPmAltConApps >=> nonEmpty))
+                   -- discard those with 'Nothing' as messages and unwrap
+                   -- the surviving 'Just's
+                   -- wrap back in the monad
+                   -- extract the 'Diagnostic' and the pattern-match constructors for
                    -- each diag-and-message, only retaining those with some constructor
-                   & map (bimap fdLspDiagnostic (getMissingCtors >=> nonEmpty))
                    -- discard those with 'Nothing' as alternatives and
                    -- unwrap the surviving 'Just's
-                   & (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
-                   & nonEmpty
-                   -- obtain the innermost diag-and-message
-                   & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
+                .> (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
   where
-    getMissingCtors :: DsMessage -> Maybe [PmAltConApp]
-    getMissingCtors =
+    (.>) = flip (.)
+
+    getDsMessage :: FileDiagnostic -> Maybe DsMessage
+    getDsMessage d = fdStructuredMessage d ^? _SomeStructuredMessage . msgEnvelopeErrorL . _DsMessage
+
+    getPmAltConApps :: DsMessage -> Maybe [PmAltConApp]
+    getPmAltConApps =
       \case DsNonExhaustivePatterns CaseAlt _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             DsNonExhaustivePatterns (LamAlt LamCase) _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             _ -> Nothing
+
+getInnermost :: [(Diagnostic, b)] -> Maybe (Diagnostic, b)
+getInnermost [] = Nothing
+getInnermost fileDiagAndDsMsg =
+  -- TODO: update doc
+  fileDiagAndDsMsg & nonEmpty
+                   -- obtain the innermost diag-and-message
+                   & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
 
 makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
 makeEditText verTxtDocId psOld psNew = do
