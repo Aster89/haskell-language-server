@@ -145,6 +145,7 @@ import           Type.Reflection                       (eqTypeRep,
                                                         typeOf, typeRep)
 import Data.Semigroup (sconcat)
 import Data.Foldable.Extra (firstJustM)
+import Data.Traversable (for)
 
 
 {- Note [Implementation strategy]
@@ -199,17 +200,8 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
                                                      state
                                                      (useE GetParsedModule nfp)
 
-            if | Just psNew <- graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
-                   -> do edit <- makeWorkspaceEdit state _textDocument psOld psNew
-                         pure $ Just $ makeCodeAction diag edit
-               | otherwise
-                   -> do logWith recorder Error LogASTUpdateError
-                         pure $ Nothing
-
-makeWorkspaceEdit :: IdeState -> TextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
-makeWorkspaceEdit state _textDocument psOld psNew
-  = do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
-       makeEditText verTxtDocId psOld psNew
+            for (graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax)
+                $ fmap (makeCodeAction diag) . makeWorkspaceEdit state _textDocument psOld
 
 makeCodeAction :: Diagnostic -> WorkspaceEdit -> CodeAction
 makeCodeAction diag edit
@@ -221,6 +213,11 @@ makeCodeAction diag edit
                , _edit        = Just edit
                , _command     = Nothing
                , _data_       = Nothing }
+
+makeWorkspaceEdit :: IdeState -> TextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
+makeWorkspaceEdit state _textDocument psOld psNew
+  = do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+       makeEditText verTxtDocId psOld psNew
 
 makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
 makeEditText verTxtDocId psOld psNew = do
