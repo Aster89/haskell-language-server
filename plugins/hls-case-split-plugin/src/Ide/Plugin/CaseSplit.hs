@@ -16,8 +16,6 @@ module Ide.Plugin.CaseSplit
 
 -- TODO: **********************REMEMBER!!!**********************
 -- make another pass with stylish-haskell
--- TODO: **********************REMEMBER!!!**********************
--- Review all haddock comments
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
@@ -27,7 +25,7 @@ import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
 import           Control.Monad.Trans                   (lift)
 import           Control.Monad.Trans.Except            (ExceptT)
-import           Control.Monad.Trans.Maybe             (MaybeT (MaybeT), runMaybeT, hoistMaybe)
+import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
@@ -35,7 +33,7 @@ import           Data.List.Extra                       (chunksOf, dropEnd,
                                                         takeEnd)
 import           Data.List.NonEmpty                    (NonEmpty ((:|)), nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
-import           Data.List.NonEmpty.Extra              ((|:), minimumBy1)
+import           Data.List.NonEmpty.Extra              ((|:))
 import           Data.Maybe                            (isJust, listToMaybe,
                                                         mapMaybe, maybeToList, isNothing)
 import           Data.Text                             (Text)
@@ -138,14 +136,12 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier, ClientCapabilities)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, ClientCapabilities, TextDocumentIdentifier)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
 import Data.Semigroup (sconcat)
-import Data.Foldable.Extra (firstJustM)
-import Data.Traversable (for)
 
 
 {- Note [Implementation strategy]
@@ -159,7 +155,13 @@ import Data.Traversable (for)
        'PmAltConApp' from the innermost "non-exhaustive patterns" diagnostic
        (several can be nested, in general),
 
-    3. craft a 'CodeAction' and return it.
+    3. retrieve some context from the handler monad (e.g. the 'ParsedSource'
+       describing the AST, and whether the 'UnicodeSyntax' extension is in
+       use),
+
+    4. craft a 'CodeAction' from the output of steps 2 and 3, and return it,
+
+    5. fail by returning an empty list of actions if anything goes wrong.
 
 -}
 
@@ -182,6 +184,7 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
+  -- TODO: remove @concat <$>@ when https://github.com/haskell/haskell-language-server/pull/5041 is done.
   fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
   let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
@@ -189,9 +192,9 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
   arrowSyntax <- getArrowSyntax state nfp
   psOld <- getParsedSource state nfp
   caps <- lift pluginGetClientCapabilities
-  verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+  verTxtDocId <- lift $ getVerTxtDocId state _textDocument
 
-  let codeAction = diagAndMissingCtors >>= makeCodeActions caps verTxtDocId psOld arrowSyntax
+  let codeAction = diagAndMissingCtors >>= makeCodeAction caps verTxtDocId psOld arrowSyntax
 
   when (isNothing codeAction)
     $ logWith recorder Error LogASTUpdateError
@@ -199,34 +202,33 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
   pure $ InL $ InR <$> maybeToList codeAction
 
   where
-    makeCodeActions caps verTxtDocId psOld arrowSyntax (diag, pmAltsConApps)
-      -- TODO: update doc
-      -- determine old and new text of the module
-        = makeCodeAction diag . makeEditText caps verTxtDocId psOld
-           <$> graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
+    makeCodeAction caps verTxtDocId psOld arrowSyntax (diag, pmAltsConApps)
+        = do psNew <- graftMissingPatterns psOld cursor pmAltsConApps arrowSyntax
+             pure $ make diag $ makeEditText caps verTxtDocId psOld psNew
+      where
+        make :: Diagnostic -> WorkspaceEdit -> CodeAction
+        make diag edit
+          = CodeAction { _title       = caseSplitPluginCodeActionTitle
+                       , _kind        = Just CodeActionKind_QuickFix
+                       , _diagnostics = Just [diag]
+                       , _isPreferred = Nothing
+                       , _disabled    = Nothing
+                       , _edit        = Just edit
+                       , _command     = Nothing
+                       , _data_       = Nothing }
 
+
+-- | Retrieve 'VersionedTextDocumentIdentifier' from the handler.
+getVerTxtDocId :: IdeState -> TextDocumentIdentifier -> HandlerM Config VersionedTextDocumentIdentifier
+getVerTxtDocId state textDoc = liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc textDoc
+
+-- | Retrieve 'ParsedSource' from the handler.
 getParsedSource :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) ParsedSource
 getParsedSource state nfp = pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
                                                             state
                                                             (useE GetParsedModule nfp)
 
-makeCodeAction :: Diagnostic -> WorkspaceEdit -> CodeAction
-makeCodeAction diag edit
-  = CodeAction { _title       = caseSplitPluginCodeActionTitle
-               , _kind        = Just CodeActionKind_QuickFix
-               , _diagnostics = Just [diag]
-               , _isPreferred = Nothing
-               , _disabled    = Nothing
-               , _edit        = Just edit
-               , _command     = Nothing
-               , _data_       = Nothing }
-
-makeEditText :: ClientCapabilities -> VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> WorkspaceEdit
-makeEditText caps verTxtDocId psOld psNew = do
-  let old = T.pack $ exactPrint psOld
-  let new = T.pack $ exactPrint psNew
-  diffText caps (verTxtDocId, old) new IncludeDeletions
-
+-- | Retrieve 'IsUnicodeSyntax' from the handler.
 getArrowSyntax :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) IsUnicodeSyntax
 getArrowSyntax state nfp = do
   (hsc_dflags . hscEnv -> dynFlags) <- runActionE "CaseSplit.GhcSessionDeps" state $ useE GhcSessionDeps nfp
@@ -234,17 +236,26 @@ getArrowSyntax state nfp = do
     then UnicodeSyntax
     else NormalSyntax
 
-extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, NonEmpty PmAltConApp)]
-extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
-                   map (fdLspDiagnostic &&& (getDsMessage >=> getPmAltConApps >=> nonEmpty))
-                   -- discard those with 'Nothing' as messages and unwrap
-                   -- the surviving 'Just's
-                   -- wrap back in the monad
-                   -- extract the 'Diagnostic' and the pattern-match constructors for
-                   -- each diag-and-message, only retaining those with some constructor
-                   -- discard those with 'Nothing' as alternatives and
-                   -- unwrap the surviving 'Just's
-                .> (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
+-- | Obtain a 'WorkspaceEdit' as 'diffText' of 'exactPrint'-ed versions of old
+-- and new 'ParsedSource's.
+makeEditText :: ClientCapabilities -> VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> WorkspaceEdit
+makeEditText caps verTxtDocId psOld psNew = do
+  let old = T.pack $ exactPrint psOld
+  let new = T.pack $ exactPrint psNew
+  diffText caps (verTxtDocId, old) new IncludeDeletions
+
+-- | Type synonym for slighly improved readability.
+type MissingPatterns = NonEmpty PmAltConApp
+
+-- | Given a @[FileDiagnostic]@ retain only those 
+extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, MissingPatterns)]
+extractDiagAndMissingCtors = map -- For each 'FileDiagnostic',
+                                 (fdLspDiagnostic -- extract is 'Diagnostic'
+                                 &&&
+                                 -- and 'Maybe' a 'NonEmpty' list of 'PmAltConApp',
+                                 (getDsMessage >=> getPmAltConApps >=> nonEmpty))
+                          -- finally, discard the irrelevant diagnostics.
+                          .> (mapMaybe sequence :: [(a, Maybe b)] -> [(a, b)])
   where
     (.>) = flip (.)
 
@@ -257,7 +268,9 @@ extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
             DsNonExhaustivePatterns (LamAlt LamCase) _ _ [identifier] nablas -> nablasToPmAlts identifier nablas
             _ -> Nothing
 
-getInnermost :: [(Diagnostic, b)] -> Maybe (Diagnostic, b)
+-- | Get the innermost (in the sense of 'isSubrangeOf') @(Diagnostic, a)@,
+-- accounting for failure.
+getInnermost :: [(Diagnostic, a)] -> Maybe (Diagnostic, a)
 getInnermost [] = Nothing
 getInnermost (a : as) = foldl' go (Just a) as
   where
@@ -265,10 +278,11 @@ getInnermost (a : as) = foldl' go (Just a) as
     go (Just acc) a = case (ordSubrange `on` Diag._range . fst) acc a of
       Just GT -> Just a
       Just _ -> Just acc
-      Nothing -> Nothing
+      Nothing -> Nothing -- If non-total order, give up.
 
--- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
--- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
+-- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ according to the
+-- 'isSubrangeOf' relationshipt between them. If neither 'isSubrangeOf' the
+-- other, return `Nothing`.
 ordSubrange :: Range -> Range -> Maybe Ordering
 ordSubrange r1 r2
   | r1 == r2 = Just EQ
@@ -288,24 +302,18 @@ nablasToPmAlts identifier nablas = fmap concat $ traverse go nablas
        . ts_facts
        . nabla_tm_st
 
-type MissingPatterns = NonEmpty PmAltConApp
-
--- | TODO: update doc
--- Given a 'ParsedModule' this function uses 'exactPrint' to produce the
--- 'Text's of said module before and after the 'MissingPatterns' are appended
--- to the existing ones in the innermost @case@ expression enclosing the
--- 'Range' of the cursor, using the arrow style passed as the last
--- 'IsUnicodeSyntax' argument.
-graftMissingPatterns :: ParsedSource -> MissingPatterns -> Range -> IsUnicodeSyntax -> Maybe ParsedSource
-graftMissingPatterns ps missingPs cursor arrowSyntax =
-  -- We want to update exactly one node of the AST, the one that is
-  -- associated to the innermost @case@ expression containing the cursor,
-  -- therefore:
-  runMaybeT (everywhereM go ps) -- we transform the 'ParsedSource' bottom-up
-                                -- (allowing failure, incidentally),
-    `evalState` False -- and we pass a 'Bool' through 'State' to bail
-                      -- out after one update.
-
+-- Given a 'ParsedSource' and a 'Range' representing the cursor position into
+-- it, this function uses a bottom-up traversal of the AST to detect the
+-- innermost @case@/@\case@@ expression encompassing the cursor's 'Range', and
+-- it appends the 'MissingPatterns' to the existing ones, if any, using the
+-- syntax @->@ or @→@ depending on the provided 'IsUnicodeSyntax'. The new
+-- 'ParsedSource' is returned in the 'Maybe' monad to account for failure.
+--
+-- Implementation detail: since we want to update exactly one node of the AST
+-- we run the computation in a 'State Bool' monad to bail out after one update.
+graftMissingPatterns :: ParsedSource -> Range -> MissingPatterns -> IsUnicodeSyntax -> Maybe ParsedSource
+graftMissingPatterns ps cursor missingPs arrowSyntax
+  = runMaybeT (everywhereM go ps) `evalState` False
     where
       go :: forall a. Data a => a -> MaybeT (State Bool) a
       go node = do
@@ -314,11 +322,11 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
                not found
                -- only inspect nodes of the appropriate type,
              , Just HRefl <- typeOf node `eqTypeRep` typeRep @(HsExpr GhcPs)
-               -- parse @case@-like expressions, and extract the 'SrcSpan' the
-               -- whole expression occupies, as well as the indentation of the
-               -- first alternative (see 'parseCaseLikeExpr' for more details),
+               -- parse the current @case@-like expressions into a 'CaseLike'
+               -- (see also 'parseCaseLikeExpr' for more details),
              , Just (CaseLike {..}) <- parseCaseLikeExpr node
-               -- make sure the cursor is somewhere in that span,
+               -- make sure the 'cursor' is somewhere in the span of that
+               -- expression,
              , cursor `inSpan` _span
                -> do -- take note we've found the node,
                      put True
@@ -326,12 +334,14 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
                      let existingMatches = getMatchGroup _expr
                      -- make a match out of each missing pattern,
                      case traverse (makeMatch arrowSyntax) missingPs of
-                        -- If something goes wrong, we communicate abortion,
+                        -- If something went wrong, we communicate abortion,
                         Nothing             -> mzero
-                        -- otherwise we continue.
-                        Just missingMatches -> pure
-                                             $ setMatches _expr
-                                             $ appendMissingPats _layout existingMatches missingMatches
+                        -- otherwise we continue
+                        Just missingMatches -> -- by appending the missing matches to the existing ones
+                                               appendMissingPats _layout existingMatches missingMatches
+                                               -- and setting those matches in a new expression.
+                                             & setMatches _expr
+                                             & pure
              -- Anything else, leave the node unchanged.
              | otherwise -> pure node
 
@@ -339,29 +349,25 @@ graftMissingPatterns ps missingPs cursor arrowSyntax =
       inSpan :: Range -> SrcSpan -> Bool
       inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
 
-data CaseLike = CaseLike { _expr :: CaseLikeExpr
-                         , _span :: SrcSpan
-                         , _layout :: MatchLayout
-                         }
-
 -- | While @HsExpr GhcPs@ can contain any expression, the following refined
 -- type can only contain a @case@ or a @\case@ expression.
 data CaseLikeExpr = Case       (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
                   | LambdaCase (XLam  GhcPs)                 (MatchGroup GhcPs (LHsExpr GhcPs))
 
--- | Get the 'MatchGroup' out of a 'CaseOrLamCase'.
+-- | A 'CaseLikeExpr' enriched with the 'SrcSpan' it occupies, together with
+-- its 'MatchLayout'.
+data CaseLike = CaseLike { _expr :: CaseLikeExpr
+                         , _span :: SrcSpan
+                         , _layout :: MatchLayout
+                         }
+
+-- | Get the 'MatchGroup' out of a 'CaseLikeExpr'.
 getMatchGroup :: CaseLikeExpr -> MatchGroup GhcPs (LHsExpr GhcPs)
 getMatchGroup (Case _ _ mg)     = mg
 getMatchGroup (LambdaCase _ mg) = mg
 
--- | Parse an @HsCase _ _ mg@ or @HsLam _ LamCase mg@ out of a @HsExpr GhcPs@,
--- and return:
---
---      - the input `HsExpr GhcPs` information, but wrapped in the refined
---        type 'CaseOrLamCase',
---      - the 'SrcSpan' the parsed expression occupies,
---      - the information for correctly indenting the matches to be inserted
---        (see also 'MatchLayout').
+-- | Parse an @HsCase _ _ mg@ or @HsLam _ LamCase mg@ out of a @HsExpr GhcPs@
+-- into the refined type 'ConLike'.
 parseCaseLikeExpr :: HsExpr GhcPs -> Maybe CaseLike
 
 parseCaseLikeExpr (HsCase ext scrut matchGroup)
@@ -391,15 +397,15 @@ parseCaseLikeExpr (HsLam ext LamCase matchGroup)
 parseCaseLikeExpr _ = Nothing
 
 -- | Isomorphic to @Maybe Matches@, this type encodes whether a @case@-like
--- expression has braces; in the positive case, it also records whether there's
+-- expression has braces; if it does, the type also records whether there are
 -- pre-existing matches.
 --
 -- See also 'Matches'.
 data MatchLayout = Braced Matches | NonBraced
 
--- | Isomorphic to @Maybe Int@, this type encodes whether there's pre-existing
--- matches in a @case@-like expression **with braces**, and - in the positive
--- case - what's the indentation of the first of them.
+-- | Isomorphic to @Maybe Int@, this type encodes whether there are
+-- pre-existing matches in a @case@-like expression **with braces**, and - if
+-- there are -  what's the indentation of the first of them.
 --
 -- Note: it could also model the same concept for the non-braced case, but that's
 -- not needed (see also 'MatchLayout').
@@ -415,9 +421,9 @@ getMatchesLayout (MG { mg_alts = L altsLoc existingMatches })
         -> let indent = fstExistingMatchCol - openingBraceCol
            in Braced $ SomeMatches indent
 
--- | Given a @case@ or @\case@ expression wrapped in our refined
--- 'CaseOrLamCase' type and a 'MatchGroup', it creates an actual corresponding
--- @HsExpr GhcPs@ with that 'MatchGroup' in it.
+-- | Given a @case@ or @\case@ expression wrapped in the refined 'CaseLikeExpr'
+-- type and a 'MatchGroup', it creates an actual corresponding @HsExpr GhcPs@
+-- with that 'MatchGroup' in it.
 setMatches :: CaseLikeExpr -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
 setMatches (Case x s _) mg     = HsCase x s mg
 setMatches (LambdaCase x _) mg = HsLam x LamCase mg
@@ -570,11 +576,11 @@ prettyChunksOf size allMatches = do
     fromZipList = NE.fromList . getZipList
 
 -- | Given a 'IsUnicodeSyntax', describing whether to use @->@ or @→@, and a
--- 'PmAltConApp', this function produces an 'LMatch' to be inserted in the list
--- of existing 'LMatch'es contained by a 'MatchGroup'.
+-- 'PmAltConApp', this function produces an 'LMatch' (to be inserted in the
+-- list of existing 'LMatch'es contained by a 'MatchGroup'), returning it into
+-- a 'Maybe' to account for failure.
 --
--- The returned 'LMatch' is wrapped in 'Maybe' to account for failure, and it
--- is constructed in its entirety, by passing "default" values wherever
+-- The 'LMatch' is constructed in its entirety, by passing "default" values wherever
 -- possible, except, obviously, for two:
 --
 --  - the constructor name,
@@ -607,6 +613,16 @@ parseSimpleConMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
 
 parseSimpleConMatch _ _ = Nothing
 
+-- | Wrapper to the all the non-default info needed to construct an 'LMatch':
+--
+--      - the arrow syntax (@->@ or @→@),
+--      - the constructor pattern (e.g. @Foo _ _@ for a binary ctor).
+data SimpleConMatch = SimpleConMatch { _arrow :: IsUnicodeSyntax
+                                     , _conPat :: Pat GhcPs
+                                     }
+
+-- | Produce an 'LMatch' using defaults for all but the information contained
+-- in the given a 'SimpleConMatch'.
 makeLMatch :: SimpleConMatch -> LMatch GhcPs (LHsExpr GhcPs)
 makeLMatch SimpleConMatch{..}
   = L noSrcSpanA $ Match { m_ext = NoExtField
@@ -622,10 +638,13 @@ makeLMatch SimpleConMatch{..}
                                            (EmptyLocalBinds NoExtField)
                          }
 
-data SimpleConMatch = SimpleConMatch { _arrow :: IsUnicodeSyntax
-                                     , _conPat :: Pat GhcPs
-                                     }
-
+-- | TODO: We could could make these values customizable via HLS plugin
+-- settings.
+--
+-- Other things that we could store here are:
+--
+--    - the maximum number of alternatives on one line
+--    - whether or not to put the @;@ for the last alternative
 data Default = Default {
   -- | Max number of underscores to show for the constructor of an alternative.
   -- Beyond this, the record syntax with empty braces is used.
@@ -633,10 +652,6 @@ data Default = Default {
   -- | Indentation used when there's no existing alternatives to refer to.
   -- Such indentation is with respect to the current layout context.
 , indentation    :: Int
-  -- TODO other things that we could store here are:
-  --
-  --    - the maximum number of alternatives on one line
-  --    - whether or not to put the @;@ for the last alternative
 }
 
 def :: Default
@@ -647,6 +662,11 @@ def = Default { maxUnderscores = 3
 -- same line.
 startSameLine :: LocatedAn ann e -> LocatedAn ann e -> Bool
 startSameLine = (==) `on` getStartLine
+  where
+    -- | Get the starting line of an 'HasSrcSpan'.
+    getStartLine :: HasSrcSpan a => a -> Int
+    getStartLine = srcSpanStartLine . realSrcSpan . getLoc
+
 
 -- | Given an @EpAnn (AnnList a)@ return the starting column of
 -- its opening brace, if any, otherwise 'Nothing'.
@@ -657,10 +677,6 @@ getOpeningBraceCol _ = Nothing
 -- | Get the starting column of an 'HasSrcSpan'.
 getStartCol :: HasSrcSpan a => a -> Int
 getStartCol = srcSpanStartCol . realSrcSpan . getLoc
-
--- | Get the starting line of an 'HasSrcSpan'.
-getStartLine :: HasSrcSpan a => a -> Int
-getStartLine = srcSpanStartLine . realSrcSpan . getLoc
 
 -- | Set the DeltaPos for the given annotation.
 setDP :: Int -> Int -> LocatedAn t a -> LocatedAn t a
@@ -677,6 +693,7 @@ setDPLine :: Int -> LocatedAn t a -> LocatedAn t a
 setDPLine deltaLine lann = setEntryDP lann
                           $ (\d -> deltaPos deltaLine (deltaColumn d))
                           $ getEntryDP lann
+
 -- | Useful helper.
 putOnNewLine :: LocatedAn t a -> LocatedAn t a
 putOnNewLine = setDPLine 1
