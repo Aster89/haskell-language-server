@@ -270,6 +270,15 @@ getInnermost fileDiagAndDsMsg =
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
 
+-- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
+-- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
+ordSubrange :: Range -> Range -> Ordering
+ordSubrange r1 r2
+  | r1 == r2 = EQ
+  | r1 `isSubrangeOf` r2 = LT
+  | r2 `isSubrangeOf` r1 = GT
+  | otherwise = error "ordSubrange: ranges are not subranges of each other"
+
 -- | Retrieve list of pattern match constructors
 -- for the type identified by the given 'Id'.
 --
@@ -281,15 +290,6 @@ nablasToPmAlts identifier nablas = fmap concat $ traverse go nablas
        . flip lookupUSDFM identifier
        . ts_facts
        . nabla_tm_st
-
--- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
--- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
-ordSubrange :: Range -> Range -> Ordering
-ordSubrange r1 r2
-  | r1 == r2 = EQ
-  | r1 `isSubrangeOf` r2 = LT
-  | r2 `isSubrangeOf` r1 = GT
-  | otherwise = error "ordSubrange: ranges are not subranges of each other"
 
 type MissingPatterns = NonEmpty PmAltConApp
 
