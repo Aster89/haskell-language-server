@@ -27,7 +27,7 @@ import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
 import           Control.Monad.Trans                   (lift)
 import           Control.Monad.Trans.Except            (ExceptT)
-import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
+import           Control.Monad.Trans.Maybe             (MaybeT (MaybeT), runMaybeT, hoistMaybe)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
@@ -138,7 +138,7 @@ import           Language.LSP.Protocol.Types           (CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier)
+                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, TextDocumentIdentifier, ClientCapabilities)
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
@@ -175,7 +175,7 @@ descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split cas
   }
 
 caseSplitPluginCodeActionTitle :: Text
-caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
+caseSplitPluginCodeActionTitle = "Add placeholders for missing patterns"
 
 suggestCaseSplitProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
 suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _range = cursor } = do
@@ -186,7 +186,12 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
 
-  codeAction <- firstJustM (makeCodeActions nfp) diagAndMissingCtors
+  arrowSyntax <- getArrowSyntax state nfp
+  psOld <- getParsedSource state nfp
+  caps <- lift pluginGetClientCapabilities
+  verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
+
+  let codeAction = diagAndMissingCtors >>= makeCodeActions caps verTxtDocId psOld arrowSyntax
 
   when (isNothing codeAction)
     $ logWith recorder Error LogASTUpdateError
@@ -194,15 +199,11 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
   pure $ InL $ InR <$> maybeToList codeAction
 
   where
-    makeCodeActions :: NormalizedFilePath -> (Diagnostic, MissingPatterns) -> ExceptT PluginError (HandlerM Config) (Maybe CodeAction)
-    makeCodeActions nfp (diag, pmAltsConApps)
+    makeCodeActions caps verTxtDocId psOld arrowSyntax (diag, pmAltsConApps)
       -- TODO: update doc
       -- determine old and new text of the module
-       = do arrowSyntax <- getArrowSyntax state nfp
-            psOld <- getParsedSource state nfp
-
-            for (graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax)
-                $ fmap (makeCodeAction diag) . makeWorkspaceEdit state _textDocument psOld
+        = makeCodeAction diag . makeEditText caps verTxtDocId psOld
+           <$> graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax
 
 getParsedSource :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) ParsedSource
 getParsedSource state nfp = pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
@@ -213,24 +214,18 @@ makeCodeAction :: Diagnostic -> WorkspaceEdit -> CodeAction
 makeCodeAction diag edit
   = CodeAction { _title       = caseSplitPluginCodeActionTitle
                , _kind        = Just CodeActionKind_QuickFix
-               , _diagnostics = Just [diag] -- TODO: is this really important? What if I just put Nothing?
+               , _diagnostics = Just [diag]
                , _isPreferred = Nothing
                , _disabled    = Nothing
                , _edit        = Just edit
                , _command     = Nothing
                , _data_       = Nothing }
 
-makeWorkspaceEdit :: IdeState -> TextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
-makeWorkspaceEdit state _textDocument psOld psNew
-  = do verTxtDocId <- liftIO $ runAction "CaseSplit.GetVersionedTextDoc" state $ getVersionedTextDoc _textDocument
-       makeEditText verTxtDocId psOld psNew
-
-makeEditText :: VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> ExceptT PluginError (HandlerM Config) WorkspaceEdit
-makeEditText verTxtDocId psOld psNew = do
+makeEditText :: ClientCapabilities -> VersionedTextDocumentIdentifier -> ParsedSource -> ParsedSource -> WorkspaceEdit
+makeEditText caps verTxtDocId psOld psNew = do
   let old = T.pack $ exactPrint psOld
   let new = T.pack $ exactPrint psNew
-  caps <- lift pluginGetClientCapabilities
-  pure $ diffText caps (verTxtDocId, old) new IncludeDeletions
+  diffText caps (verTxtDocId, old) new IncludeDeletions
 
 getArrowSyntax :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) IsUnicodeSyntax
 getArrowSyntax state nfp = do
@@ -264,21 +259,22 @@ extractDiagAndMissingCtors = -- pair each file diag with its ds messages, if any
 
 getInnermost :: [(Diagnostic, b)] -> Maybe (Diagnostic, b)
 getInnermost [] = Nothing
-getInnermost fileDiagAndDsMsg =
-  -- TODO: update doc
-  fileDiagAndDsMsg & nonEmpty
-                   -- obtain the innermost diag-and-message
-                   & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
-
+getInnermost (a : as) = foldl' go (Just a) as
+  where
+    go Nothing _ = Nothing
+    go (Just acc) a = case (ordSubrange `on` Diag._range . fst) acc a of
+      Just GT -> Just a
+      Just _ -> Just acc
+      Nothing -> Nothing
 
 -- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
 -- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
-ordSubrange :: Range -> Range -> Ordering
+ordSubrange :: Range -> Range -> Maybe Ordering
 ordSubrange r1 r2
-  | r1 == r2 = EQ
-  | r1 `isSubrangeOf` r2 = LT
-  | r2 `isSubrangeOf` r1 = GT
-  | otherwise = error "ordSubrange: ranges are not subranges of each other"
+  | r1 == r2 = Just EQ
+  | r1 `isSubrangeOf` r2 = Just LT
+  | r2 `isSubrangeOf` r1 = Just GT
+  | otherwise = Nothing
 
 -- | Retrieve list of pattern match constructors
 -- for the type identified by the given 'Id'.
