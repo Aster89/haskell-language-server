@@ -196,12 +196,15 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
       -- TODO: update doc
       -- determine old and new text of the module
        = do arrowSyntax <- getArrowSyntax state nfp
-            psOld <- pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
-                                                     state
-                                                     (useE GetParsedModule nfp)
+            psOld <- getParsedSource state nfp
 
             for (graftMissingPatterns psOld pmAltsConApps cursor arrowSyntax)
                 $ fmap (makeCodeAction diag) . makeWorkspaceEdit state _textDocument psOld
+
+getParsedSource :: IdeState -> NormalizedFilePath -> ExceptT PluginError (HandlerM Config) ParsedSource
+getParsedSource state nfp = pm_parsed_source <$> runActionE "CaseSplit.GetParsedModule"
+                                                            state
+                                                            (useE GetParsedModule nfp)
 
 makeCodeAction :: Diagnostic -> WorkspaceEdit -> CodeAction
 makeCodeAction diag edit
