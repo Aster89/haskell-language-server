@@ -14,12 +14,10 @@ module Ide.Plugin.CaseSplit
   , Log
   ) where
 
--- TODO: **********************REMEMBER!!!**********************
--- make another pass with stylish-haskell
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
-import           Control.Monad                         (mzero, (>=>), when)
+import           Control.Monad                         (mzero, when, (>=>))
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
@@ -31,11 +29,14 @@ import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
 import           Data.List.Extra                       (chunksOf, dropEnd,
                                                         takeEnd)
-import           Data.List.NonEmpty                    (NonEmpty ((:|)), nonEmpty)
+import           Data.List.NonEmpty                    (NonEmpty ((:|)),
+                                                        nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
 import           Data.List.NonEmpty.Extra              ((|:))
-import           Data.Maybe                            (isJust, listToMaybe,
-                                                        mapMaybe, maybeToList, isNothing)
+import           Data.Maybe                            (isJust, isNothing,
+                                                        listToMaybe, mapMaybe,
+                                                        maybeToList)
+import           Data.Semigroup                        (sconcat)
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
 import           Development.IDE                       (FileDiagnostic (fdStructuredMessage),
@@ -84,7 +85,8 @@ import           GHC                                   (AnnList (AnnList),
                                                         HasLoc (getHasLoc),
                                                         LMatch,
                                                         ParsedModule (pm_parsed_source),
-                                                        realSrcSpan, ParsedSource)
+                                                        ParsedSource,
+                                                        realSrcSpan)
 import           GHC.Driver.DynFlags                   (OnOff (On))
 import           GHC.Hs                                (DeltaPos (deltaColumn),
                                                         EpAnnLam (EpAnnLam),
@@ -109,16 +111,19 @@ import           GHC.Types.SrcLoc                      (GenLocated (L),
                                                         SrcSpan (RealSrcSpan),
                                                         combineSrcSpans)
 import           GHC.Types.Unique.SDFM                 (lookupUSDFM)
-import           Ide.Logger                            (logWith, Priority (Error))
-import           Ide.Plugin.Error                      (getNormalizedFilePathE, PluginError)
+import           Ide.Logger                            (Priority (Error),
+                                                        logWith)
+import           Ide.Plugin.Error                      (PluginError,
+                                                        getNormalizedFilePathE)
 import           Ide.PluginUtils                       (WithDeletions (IncludeDeletions),
                                                         diffText)
-import           Ide.Types                             (PluginDescriptor (pluginHandlers),
+import           Ide.Types                             (Config, HandlerM,
+                                                        PluginDescriptor (pluginHandlers),
                                                         PluginId,
                                                         PluginMethodHandler,
                                                         defaultPluginDescriptor,
                                                         mkPluginHandler,
-                                                        pluginGetClientCapabilities, HandlerM, Config)
+                                                        pluginGetClientCapabilities)
 import           Language.Haskell.Syntax               (HsConDetails (PrefixCon, RecCon),
                                                         HsLocalBindsLR (EmptyLocalBinds),
                                                         LHsExpr,
@@ -132,16 +137,22 @@ import           Language.Haskell.Syntax.Expr          (GRHS (GRHS),
 import qualified Language.LSP.Protocol.Lens            as L
 import           Language.LSP.Protocol.Message         (Method (Method_TextDocumentCodeAction))
 import qualified Language.LSP.Protocol.Message         as LSP
-import           Language.LSP.Protocol.Types           (CodeAction (..),
+import           Language.LSP.Protocol.Types           (ClientCapabilities,
+                                                        CodeAction (..),
                                                         CodeActionKind (CodeActionKind_QuickFix),
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
-                                                        Range, isSubrangeOf,
-                                                        type (|?) (InL, InR), WorkspaceEdit, VersionedTextDocumentIdentifier, NormalizedFilePath, Diagnostic, ClientCapabilities, TextDocumentIdentifier)
+                                                        Diagnostic,
+                                                        NormalizedFilePath,
+                                                        Range,
+                                                        TextDocumentIdentifier,
+                                                        VersionedTextDocumentIdentifier,
+                                                        WorkspaceEdit,
+                                                        isSubrangeOf,
+                                                        type (|?) (InL, InR))
 import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_range))
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
-import Data.Semigroup (sconcat)
 
 
 {- Note [Implementation strategy]
@@ -247,7 +258,9 @@ makeEditText caps verTxtDocId psOld psNew = do
 -- | Type synonym for slighly improved readability.
 type MissingPatterns = NonEmpty PmAltConApp
 
--- | Given a @[FileDiagnostic]@ retain only those 
+-- | Given a @[FileDiagnostic]@ retain only those relative
+-- to the GHC-62161 diagnostic and extract the list of missing
+-- patterns from those.
 extractDiagAndMissingCtors :: [FileDiagnostic] -> [(Diagnostic, MissingPatterns)]
 extractDiagAndMissingCtors = map -- For each 'FileDiagnostic',
                                  (fdLspDiagnostic -- extract is 'Diagnostic'
@@ -277,7 +290,7 @@ getInnermost (a : as) = foldl' go (Just a) as
     go Nothing _ = Nothing
     go (Just acc) a = case (ordSubrange `on` Diag._range . fst) acc a of
       Just GT -> Just a
-      Just _ -> Just acc
+      Just _  -> Just acc
       Nothing -> Nothing -- If non-total order, give up.
 
 -- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ according to the
@@ -356,8 +369,8 @@ data CaseLikeExpr = Case       (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (
 
 -- | A 'CaseLikeExpr' enriched with the 'SrcSpan' it occupies, together with
 -- its 'MatchLayout'.
-data CaseLike = CaseLike { _expr :: CaseLikeExpr
-                         , _span :: SrcSpan
+data CaseLike = CaseLike { _expr   :: CaseLikeExpr
+                         , _span   :: SrcSpan
                          , _layout :: MatchLayout
                          }
 
@@ -617,7 +630,7 @@ parseSimpleConMatch _ _ = Nothing
 --
 --      - the arrow syntax (@->@ or @→@),
 --      - the constructor pattern (e.g. @Foo _ _@ for a binary ctor).
-data SimpleConMatch = SimpleConMatch { _arrow :: IsUnicodeSyntax
+data SimpleConMatch = SimpleConMatch { _arrow  :: IsUnicodeSyntax
                                      , _conPat :: Pat GhcPs
                                      }
 
