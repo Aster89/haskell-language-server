@@ -174,6 +174,9 @@ descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split cas
   { pluginHandlers = mkPluginHandler LSP.SMethod_TextDocumentCodeAction (suggestCaseSplitProvider recorder)
   }
 
+caseSplitPluginCodeActionTitle :: Text
+caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
+
 suggestCaseSplitProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
 suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _range = cursor } = do
 
@@ -267,8 +270,6 @@ getInnermost fileDiagAndDsMsg =
                    -- obtain the innermost diag-and-message
                    & fmap (minimumBy1 (ordSubrange `on` Diag._range . fst))
 
-caseSplitPluginCodeActionTitle :: Text
-caseSplitPluginCodeActionTitle = "Add placeholders for the first `-fmax-uncovered-patterns` missing patterns"
 
 -- | Assign an 'Ordering' to two 'Range's @r1@ and @r2@ of which either is assumed to be subset of the other.
 -- Will throw a runtime error if @r1@ is not a subrange of @r2@ or vice versa.
