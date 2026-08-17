@@ -195,8 +195,7 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
-  -- TODO: remove @concat <$>@ when https://github.com/haskell/haskell-language-server/pull/5041 is done.
-  fileDiags <- concat <$> activeDiagnosticsInRange (shakeExtras state) nfp cursor
+  fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
   let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
 
