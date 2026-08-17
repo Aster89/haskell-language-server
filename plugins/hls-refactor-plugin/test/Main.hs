@@ -970,6 +970,29 @@ removeImportTests = testGroup "remove import actions"
             , "module ModuleB where"
             ]
       liftIO $ expectedContentAfterAction @=? contentAfterAction
+  , testSession "remove all - v2" $ do
+      let content = T.unlines
+            [ "{-# LANGUAGE EmptyCase #-}"
+            , "{-# OPTIONS_GHC -Wall -fmax-uncovered-patterns=99 #-}"
+            , "module Foo where"
+            , "import Control.Monad.Trans.Maybe (hoistMaybe, MaybeT (MaybeT))"
+            , "go :: MaybeT IO a"
+            , "go = undefined"
+            ]
+      doc <- createDoc "ModuleC.hs" "haskell" content
+      _ <- waitForDiagnostics
+      action <- pickActionWithTitle "Remove all redundant imports" =<< getAllCodeActions doc
+      executeCodeAction action
+      contentAfterAction <- documentContents doc
+      let expectedContentAfterAction = T.unlines
+            [ "{-# LANGUAGE EmptyCase #-}"
+            , "{-# OPTIONS_GHC -Wall -fmax-uncovered-patterns=99 #-}"
+            , "module Foo where"
+            , "import Control.Monad.Trans.Maybe (MaybeT ())"
+            , "go :: MaybeT IO a"
+            , "go = undefined"
+            ]
+      liftIO $ expectedContentAfterAction @=? contentAfterAction
   , testSession "remove all" $ do
       let content = T.unlines
             [ "{-# OPTIONS_GHC -Wunused-imports #-}"
@@ -979,9 +1002,12 @@ removeImportTests = testGroup "remove import actions"
             , "import Data.Functor.Identity"
             , "import Data.Functor.Sum (Sum (InL, InR))"
             , "import qualified Data.Kind as K (Constraint, Type)"
+            , "import Control.Monad.Trans.Maybe (MaybeT (MaybeT), hoistMaybe)"
             , "x = InL (Identity 123)"
             , "y = fix id"
             , "type T = K.Type"
+            , "go :: MaybeT IO a"
+            , "go = undefined"
             ]
       doc <- createDoc "ModuleC.hs" "haskell" content
       _ <- waitForDiagnostics
@@ -995,9 +1021,12 @@ removeImportTests = testGroup "remove import actions"
             , "import Data.Functor.Identity"
             , "import Data.Functor.Sum (Sum (InL))"
             , "import qualified Data.Kind as K (Type)"
+            , "import Control.Monad.Trans.Maybe (MaybeT ())"
             , "x = InL (Identity 123)"
             , "y = fix id"
             , "type T = K.Type"
+            , "go :: MaybeT IO a"
+            , "go = undefined"
             ]
       liftIO $ expectedContentAfterAction @=? contentAfterAction
   , testSession "remove unused operators whose name ends with '.'" $ do
