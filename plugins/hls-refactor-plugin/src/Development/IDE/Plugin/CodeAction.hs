@@ -152,12 +152,14 @@ import           GHC.Tc.Types.CtLoc                                (ctl_env,
 #endif
 
 import           GHC.Tc.Types.Origin                               (CtOrigin (LiteralOrigin))
+import Debug.Trace (traceIO)
 
 -------------------------------------------------------------------------------------------------
 
 -- | Generate code actions.
 codeAction :: PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
 codeAction state _ (CodeActionParams _ _ (TextDocumentIdentifier uri) range _) = do
+  liftIO $ traceIO $ show range
   contents <- liftIO $ runAction "hls-refactor-plugin.codeAction.getUriContents" state $ getUriContents $ toNormalizedUri uri
   liftIO $ do
     let mbFile = toNormalizedFilePath' <$> uriToFilePath uri
