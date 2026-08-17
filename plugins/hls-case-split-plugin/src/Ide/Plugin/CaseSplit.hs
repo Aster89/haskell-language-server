@@ -740,9 +740,7 @@ mapFirst f (a :| as) = f a :| as
 -- | Maps a function @f@ over the last element of a 'NonEmpty' list.
 mapLast :: (a -> a) -> NonEmpty a -> NonEmpty a
 mapLast f (a :| []) = f a :| []
-mapLast f (a :| as) = a :| mapLast' f as
-  where
-    mapLast' f as = init as ++ [f $ last as]
+mapLast f (a :| b : cs) = a :| NE.toList (mapLast f $ b :| cs)
 
 -- | Convenient negation of 'any'.
 none :: Foldable t => (a -> Bool) -> t a -> Bool
