@@ -22,11 +22,12 @@
        "non-exhaustive patterns" diagnostics (i.e. those containing a
        'DsMessage' constructed via 'DsNonExhaustivePatterns'),
 
-    3. some functions running in the @'ExceptT' 'PluginError' ('HandlerM' 'Config')@
-       monad are used retrieve some context necessary to construct the
-       'WorkspaceEdit' and to apply it:
+    3. some functions running in the @'ExceptT' 'PluginError' ('HandlerM'
+       'Config')@ monad are used retrieve some context necessary to construct
+       the 'WorkspaceEdit' and to apply it:
 
-          - the 'ParsedSource' describing the AST before the change to be applied,
+          - the 'ParsedSource' describing the AST before the change to be
+            applied,
           - whether the 'UnicodeSyntax' extension is in use,
           - the 'ClientCapabilities',
           - the 'VersionedTextDocumentIdentifier',
@@ -38,20 +39,23 @@
             @\case@) expression encompassing the cursor position,
 
                 - in this phase, the relevant @case@ expression is parsed
-                  for detecting the current layout (whether the existing alternatives,
-                  if any, are between @{@ and @}@, and in that case, what's the
-                  indentation of the first existing alternative),
+                  for detecting the current layout (whether the existing
+                  alternatives, if any, are between @{@ and @}@, and in that
+                  case, what's the indentation of the first existing
+                  alternative),
 
           - turning the missing 'PmAltConApp's patterns (obtained from the
             diagnostic in step 2 above) into 'LMatch'es (to be inserted in the
             AST) via 'makeMatch',
 
-               - 'makeMatch' can currently "fail" (by returning in 'Either') because we don't
-                 support missing patterns that are not 'PmAltConLike' or, if they are,
-                 that are not 'RealDataCon', in which case we simply log this fact and
-                 return an empty list of 'CodeAction's.
+               - 'makeMatch' can currently "fail" (by returning in 'Either')
+                 because we don't support missing patterns that are not
+                 'PmAltConLike' or, if they are, that are not 'RealDataCon', in
+                 which case we simply log this fact and return an empty list of
+                 'CodeAction's.
 
-          - appending those 'LMatch'es to the existing ones, honoring the existing layout.
+          - appending those 'LMatch'es to the existing ones, honoring the
+            existing layout.
 -}
 
 module Ide.Plugin.CaseSplit
@@ -91,6 +95,7 @@ import           Development.IDE                       (FileDiagnostic (fdStruct
                                                         HscEnvEq (hscEnv),
                                                         IdeState (shakeExtras),
                                                         Pretty (pretty),
+                                                        Range (Range, _start),
                                                         Recorder, WithPriority,
                                                         runAction,
                                                         srcSpanToRange)
@@ -190,7 +195,6 @@ import           Language.LSP.Protocol.Types           (ClientCapabilities,
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Diagnostic,
                                                         NormalizedFilePath,
-                                                        Range,
                                                         TextDocumentIdentifier,
                                                         VersionedTextDocumentIdentifier,
                                                         WorkspaceEdit,
@@ -215,8 +219,30 @@ descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split cas
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for missing patterns"
 
+-- | The '_range' from a 'CodeActionParams' seems to refer to the cursor
+-- as a 1-character long 'Range', e.g. @'Range' ('Position' n 0) ('Position' n 1)@
+-- represents the cursor at the 0th (i.e. 0-based first) column of the 0-based
+-- @n@th line.
+--
+-- However, this 'Range' seems to behave strangely, and the net effect is the following:
+--
+--   - given a snippet where @code something of@ is **at the end of a line**,
+--   - and the cursor on the `o` or `f` of `of`,
+--
+-- the '_range' will actually end at the beginning of the following line, which
+-- means that the case-split plugin won't present its action.
+--
+-- The workaround is to use only the '_start' of the 'Range'.
+--
+-- See also https://github.com/haskell/haskell-language-server/issues/5046 for
+-- more info.
+workaround :: Range -> Range
+workaround Range { _start } = Range _start _start
+
 suggestCaseSplitProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
-suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _range = cursor } = do
+suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument
+                                                          , _range = workaround -> cursor }
+  = do
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
 
