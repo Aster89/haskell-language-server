@@ -603,8 +603,8 @@ makeMatch arrow pmAltConApp = makeLMatch <$> parseSimpleConMatch arrow pmAltConA
 
 parseSimpleConMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe SimpleConMatch
 parseSimpleConMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
-                          , paca_ids
-                          }
+                              , paca_ids
+                              }
   = let locatedCon = L noSrcSpanA $ nameRdrName $ getName dataCon
         conPat = case length paca_ids of
                     -- for low number of arguments
