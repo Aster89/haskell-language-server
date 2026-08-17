@@ -8,6 +8,52 @@
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE ViewPatterns      #-}
 
+{- | Note [Implementation strategy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  The present plugin achieves its target of appending the missing patterns to a
+  non-exhaustive @case@ (or @\case@) expression via the following strategy:
+
+    1. the HLS utility 'activeDiagnosticsInRange' retrieves the
+       @['FileDiagnostic']@ under the cursor,
+
+    2. @'getInnermost' . 'extractDiagAndMissingCtors'@ is used to extract the
+       'Diagnostic' and the 'NonEmpty' list of missing 'PmAltConApp' from the
+       innermost ("innermost" intended according to 'isSubrangeOf') among the
+       "non-exhaustive patterns" diagnostics (i.e. those containing a
+       'DsMessage' constructed via 'DsNonExhaustivePatterns'),
+
+    3. some functions running in the @'ExceptT' 'PluginError' ('HandlerM' 'Config')@
+       monad are used retrieve some context necessary to construct the
+       'WorkspaceEdit' and to apply it:
+
+          - the 'ParsedSource' describing the AST before the change to be applied,
+          - whether the 'UnicodeSyntax' extension is in use,
+          - the 'ClientCapabilities',
+          - the 'VersionedTextDocumentIdentifier',
+
+    4. 'graftMissingPatterns' uses 'everywhereM' to traverse the AST, for the
+       purpose of
+
+          - pinpointing the one node representing the innermost @case@ (or
+            @\case@) expression encompassing the cursor position,
+
+                - in this phase, the relevant @case@ expression is parsed
+                  for detecting the current layout (whether the existing alternatives,
+                  if any, are between @{@ and @}@, and in that case, what's the
+                  indentation of the first existing alternative),
+
+          - turning the missing 'PmAltConApp's patterns (obtained from the
+            diagnostic in step 2 above) into 'LMatch'es (to be inserted in the
+            AST) via 'makeMatch',
+
+               - 'makeMatch' can currently "fail" (by returning in 'Either') because we don't
+                 support missing patterns that are not 'PmAltConLike' or, if they are,
+                 that are not 'RealDataCon', in which case we simply log this fact and
+                 return an empty list of 'CodeAction's.
+
+          - appending those 'LMatch'es to the existing ones, honoring the existing layout.
+-}
+
 module Ide.Plugin.CaseSplit
   ( caseSplitPluginCodeActionTitle
   , descriptor
@@ -17,13 +63,14 @@ module Ide.Plugin.CaseSplit
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
 import           Control.Lens                          ((^.), (^?))
-import           Control.Monad                         (mzero, when, (>=>))
+import           Control.Monad                         ((>=>))
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
                                                         State, evalState)
 import           Control.Monad.Trans                   (lift)
+import           Control.Monad.Trans.Either            (EitherT, left,
+                                                        runEitherT)
 import           Control.Monad.Trans.Except            (ExceptT)
-import           Control.Monad.Trans.Maybe             (MaybeT, runMaybeT)
 import           Data.Data                             (Data)
 import           Data.Function                         (on, (&))
 import           Data.Generics.Schemes                 (everywhereM)
@@ -33,9 +80,8 @@ import           Data.List.NonEmpty                    (NonEmpty ((:|)),
                                                         nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
 import           Data.List.NonEmpty.Extra              ((|:))
-import           Data.Maybe                            (isJust, isNothing,
-                                                        listToMaybe, mapMaybe,
-                                                        maybeToList)
+import           Data.Maybe                            (isJust, listToMaybe,
+                                                        mapMaybe, maybeToList)
 import           Data.Semigroup                        (sconcat)
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
@@ -56,7 +102,8 @@ import           Development.IDE.GHC.Compat            (ConLike (RealDataCon),
                                                         HsMatchContext (CaseAlt),
                                                         HscEnv (hsc_dflags), Id,
                                                         NamedThing (getName),
-                                                        getLoc)
+                                                        Outputable (ppr),
+                                                        getLoc, showSDocUnsafe)
 import           Development.IDE.GHC.Compat.Core       (AnnListItem,
                                                         EpAnnHsCase (EpAnnHsCase),
                                                         GrhsAnn (..),
@@ -111,7 +158,7 @@ import           GHC.Types.SrcLoc                      (GenLocated (L),
                                                         SrcSpan (RealSrcSpan),
                                                         combineSrcSpans)
 import           GHC.Types.Unique.SDFM                 (lookupUSDFM)
-import           Ide.Logger                            (Priority (Error),
+import           Ide.Logger                            (Priority (Warning),
                                                         logWith)
 import           Ide.Plugin.Error                      (PluginError,
                                                         getNormalizedFilePathE)
@@ -154,33 +201,11 @@ import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
 
-
-{- Note [Implementation strategy]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  The present plugin achieves its target of inserting the missing patterns to a
-  non-exhaustive @case@ (or @\case@) expression via the following strategy:
-
-    1. retrieve the '[FileDiagnostic]' under the cursor,
-
-    2. extract the 'Diagnostic' and the 'NonEmpty' list of missing
-       'PmAltConApp' from the innermost "non-exhaustive patterns" diagnostic
-       (several can be nested, in general),
-
-    3. retrieve some context from the handler monad (e.g. the 'ParsedSource'
-       describing the AST, and whether the 'UnicodeSyntax' extension is in
-       use),
-
-    4. craft a 'CodeAction' from the output of steps 2 and 3, and return it,
-
-    5. fail by returning an empty list of actions if anything goes wrong.
-
--}
-
 data Log where
-  LogASTUpdateError :: Log
+  LogPatternNotSupportedYet :: String -> Log
 
 instance Pretty Log where
-  pretty LogASTUpdateError = "Error in updating the AST."
+  pretty (LogPatternNotSupportedYet unsupportedPat) = "The case-split plugin does not support the pattern " <> pretty unsupportedPat <> " yet."
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split case code action")
@@ -197,21 +222,27 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument, _rang
 
   fileDiags <- activeDiagnosticsInRange (shakeExtras state) nfp cursor
 
-  let diagAndMissingCtors = getInnermost $ extractDiagAndMissingCtors fileDiags
+  let diagAndMissingCtors = getInnermost . extractDiagAndMissingCtors $ fileDiags
 
   arrowSyntax <- getArrowSyntax state nfp
   psOld <- getParsedSource state nfp
   caps <- lift pluginGetClientCapabilities
   verTxtDocId <- lift $ getVerTxtDocId state _textDocument
 
-  let codeAction = diagAndMissingCtors >>= makeCodeAction caps verTxtDocId psOld arrowSyntax
-
-  when (isNothing codeAction)
-    $ logWith recorder Error LogASTUpdateError
+  codeAction <- case traverse (makeCodeAction caps verTxtDocId psOld arrowSyntax) diagAndMissingCtors of
+                     Left unsupportedPat -> do logWith recorder Warning $ LogPatternNotSupportedYet unsupportedPat
+                                               pure Nothing
+                     Right cAct -> pure cAct
 
   pure $ InL $ InR <$> maybeToList codeAction
 
   where
+    makeCodeAction :: ClientCapabilities
+                   -> VersionedTextDocumentIdentifier
+                   -> ParsedSource
+                   -> IsUnicodeSyntax
+                   -> (Diagnostic, MissingPatterns)
+                   -> Either String CodeAction
     makeCodeAction caps verTxtDocId psOld arrowSyntax (diag, pmAltsConApps)
         = do psNew <- graftMissingPatterns psOld cursor pmAltsConApps arrowSyntax
              pure $ make diag $ makeEditText caps verTxtDocId psOld psNew
@@ -314,20 +345,20 @@ nablasToPmAlts identifier nablas = fmap concat $ traverse go nablas
        . ts_facts
        . nabla_tm_st
 
--- Given a 'ParsedSource' and a 'Range' representing the cursor position into
+-- | Given a 'ParsedSource' and a 'Range' representing the cursor position into
 -- it, this function uses a bottom-up traversal of the AST to detect the
--- innermost @case@/@\case@@ expression encompassing the cursor's 'Range', and
+-- innermost @case@/@\case@ expression encompassing the cursor's 'Range', and
 -- it appends the 'MissingPatterns' to the existing ones, if any, using the
 -- syntax @->@ or @→@ depending on the provided 'IsUnicodeSyntax'. The new
 -- 'ParsedSource' is returned in the 'Maybe' monad to account for failure.
 --
 -- Implementation detail: since we want to update exactly one node of the AST
 -- we run the computation in a 'State Bool' monad to bail out after one update.
-graftMissingPatterns :: ParsedSource -> Range -> MissingPatterns -> IsUnicodeSyntax -> Maybe ParsedSource
+graftMissingPatterns :: ParsedSource -> Range -> MissingPatterns -> IsUnicodeSyntax -> Either String ParsedSource
 graftMissingPatterns ps cursor missingPs arrowSyntax
-  = runMaybeT (everywhereM go ps) `evalState` False
+  = runEitherT (everywhereM go ps) `evalState` False
     where
-      go :: forall a. Data a => a -> MaybeT (State Bool) a
+      go :: forall a. Data a => a -> EitherT String (State Bool) a
       go node = do
           found <- get
           if | -- Proceed only if we haven't found & edited the node yet,
@@ -346,10 +377,10 @@ graftMissingPatterns ps cursor missingPs arrowSyntax
                      let existingMatches = getMatchGroup _expr
                      -- make a match out of each missing pattern,
                      case traverse (makeMatch arrowSyntax) missingPs of
-                        -- If something went wrong, we communicate abortion,
-                        Nothing             -> mzero
+                        -- If this sort of pattern is not supported, we communicate abortion,
+                        Left unsupportedPat  -> left unsupportedPat
                         -- otherwise we continue
-                        Just missingMatches -> -- by appending the missing matches to the existing ones
+                        Right missingMatches -> -- by appending the missing matches to the existing ones
                                                appendMissingPats _layout existingMatches missingMatches
                                                -- and setting those matches in a new expression.
                                              & setMatches _expr
@@ -598,10 +629,10 @@ prettyChunksOf size allMatches = do
 --  - the constructor name,
 --  - the arguments to the constructor, all rendered as individual underscores
 --    when there's less than @maxUnderscores def@, or as a single @{}@ otherwise.
-makeMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe (LMatch GhcPs (LHsExpr GhcPs))
+makeMatch :: IsUnicodeSyntax -> PmAltConApp -> Either String (LMatch GhcPs (LHsExpr GhcPs))
 makeMatch arrow pmAltConApp = makeLMatch <$> parseSimpleConMatch arrow pmAltConApp
 
-parseSimpleConMatch :: IsUnicodeSyntax -> PmAltConApp -> Maybe SimpleConMatch
+parseSimpleConMatch :: IsUnicodeSyntax -> PmAltConApp -> Either String SimpleConMatch
 parseSimpleConMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
                               , paca_ids
                               }
@@ -619,11 +650,11 @@ parseSimpleConMatch arrow PACA{ paca_con = PmAltConLike (RealDataCon dataCon)
                                 , pat_con = locatedCon
                                 , pat_args = RecCon (HsRecFields NoExtField [] Nothing)
                                 }
-    in Just
+    in Right
      $ SimpleConMatch { _arrow = arrow
                       , _conPat = conPat }
 
-parseSimpleConMatch _ _ = Nothing
+parseSimpleConMatch _ paca = Left $ showSDocUnsafe $ ppr paca
 
 -- | Wrapper to the all the non-default info needed to construct an 'LMatch':
 --
@@ -738,7 +769,7 @@ mapFirst f (a :| as) = f a :| as
 
 -- | Maps a function @f@ over the last element of a 'NonEmpty' list.
 mapLast :: (a -> a) -> NonEmpty a -> NonEmpty a
-mapLast f (a :| []) = f a :| []
+mapLast f (a :| [])     = f a :| []
 mapLast f (a :| b : cs) = a :| NE.toList (mapLast f $ b :| cs)
 
 -- | Convenient negation of 'any'.
