@@ -84,8 +84,9 @@ import           Data.List.NonEmpty                    (NonEmpty ((:|)),
                                                         nonEmpty)
 import qualified Data.List.NonEmpty                    as NE
 import           Data.List.NonEmpty.Extra              ((|:))
-import           Data.Maybe                            (isJust, listToMaybe,
-                                                        mapMaybe, maybeToList)
+import           Data.Maybe                            (fromMaybe, isJust,
+                                                        listToMaybe, mapMaybe,
+                                                        maybeToList)
 import           Data.Semigroup                        (sconcat)
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
@@ -98,7 +99,7 @@ import           Development.IDE                       (FileDiagnostic (fdStruct
                                                         Range (Range, _start),
                                                         Recorder, WithPriority,
                                                         runAction,
-                                                        srcSpanToRange)
+                                                        spanContainsRange)
 import           Development.IDE.Core.FileStore        (getVersionedTextDoc)
 import           Development.IDE.Core.PluginUtils      (activeDiagnosticsInRange,
                                                         runActionE, useE)
@@ -416,7 +417,7 @@ graftMissingPatterns ps cursor missingPs arrowSyntax
 
       -- | Predicate telling the given 'Range' falls within the given 'SrcSpan'.
       inSpan :: Range -> SrcSpan -> Bool
-      inSpan range s = maybe False (range `isSubrangeOf`) (srcSpanToRange s)
+      inSpan range s = fromMaybe False $ s `spanContainsRange` range
 
 -- | While @HsExpr GhcPs@ can contain any expression, the following refined
 -- type can only contain a @case@ or a @\case@ expression.
