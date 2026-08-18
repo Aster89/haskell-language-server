@@ -118,6 +118,12 @@ codeActionTests = testGroup
   -- Support UnicodeSyntax
   , goldenWithClass "Use → instead of -> when UnicodeSyntax is On" "TUnicodeArrow" $
       Prelude.flip inspectCodeAction [title]
+
+  -- Some more corner cases
+  , expectNoCodeActionAvailable "No action on `Int`" "TInt"
+  , expectNoCodeActionAvailable "Cannot see through condition of a single catch-all pattern" "TWithCond"
+  , goldenWithClass "Ignore catch-all pattern in presence of non-catch-all pattern" "TWithCondAndPat" $
+      Prelude.flip inspectCodeAction [title]
   ]
 
 waitForDiagnosticsFrom :: TextDocumentIdentifier -> Session [Diagnostic]
