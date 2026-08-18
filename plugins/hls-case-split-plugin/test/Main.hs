@@ -6,13 +6,13 @@ module Main
   ( main
   ) where
 
-import           Control.Lens                  (Prism', prism', (^.),
-                                                (^..), (^?))
-import qualified Ide.Plugin.CaseSplit          as CS
-import qualified Language.LSP.Protocol.Lens    as L
+import           Control.Lens               (Prism', prism', (^.), (^..), (^?))
+import           Data.Text                  (Text)
+import qualified Ide.Plugin.CaseSplit       as CS
+import qualified Language.LSP.Protocol.Lens as L
 import           System.FilePath
-import           Test.Hls                      hiding (waitForDiagnosticsFrom)
-import qualified Test.Hls.FileSystem           as FS
+import           Test.Hls                   hiding (waitForDiagnosticsFrom)
+import qualified Test.Hls.FileSystem        as FS
 
 main :: IO ()
 main = defaultTestRunner tests
@@ -115,6 +115,21 @@ codeActionTests = testGroup
   , goldenWithRange "Incomplete `case` nested in incomplete `case`" "TIncompleteCaseInsideIncompleteCase" $
       Range (Position 15 30) (Position 15 31)
 
+  -- Extreme cursor positions
+  , expectCodeActionsAvailable "Cursor before `c` of `case`" "TNoPatternsNoBraces"
+      (Range (Position 12 7) (Position 12 8))
+      []
+
+  , expectCodeActionsAvailable "Cursor on `c` of `case`" "TNoPatternsNoBraces"
+      (Range (Position 12 8) (Position 12 9))
+      [ CS.caseSplitPluginCodeActionTitle
+      ]
+
+  , expectCodeActionsAvailable "Cursor on `f` of `of`" "TNoPatternsNoBraces"
+      (Range (Position 12 16) (Position 13 0))
+      [ CS.caseSplitPluginCodeActionTitle
+      ]
+
   -- Support UnicodeSyntax
   , goldenWithClass "Use → instead of -> when UnicodeSyntax is On" "TUnicodeArrow" $
       Prelude.flip inspectCodeAction [title]
@@ -141,6 +156,23 @@ _CACodeAction = prism' InR $ \case
   InR action -> Just action
   _          -> Nothing
 
+expectCodeActionsAvailable :: TestName -> FilePath -> Range -> [Text] -> TestTree
+expectCodeActionsAvailable title path range actionTitles =
+  testCase title $ do
+    runSessionWithServerInTmpDir def caseSplitPlugin (mkFs $ FS.directProject (path <.> "hs")) $ do
+      doc <- openDoc (path <.> "hs") "haskell"
+      _ <- waitForDiagnosticsFrom doc
+      caResults <- getCodeActions doc range
+      liftIO $ map (^? _CACodeAction . L.title) caResults
+        @?= expectedActions
+    where
+      expectedActions = Just <$> actionTitles
+
+expectNoCodeActionAvailable :: TestName -> FilePath -> TestTree
+expectNoCodeActionAvailable title path = expectCodeActionsAvailable title path anywhere []
+  where
+    anywhere = Range (Position 0 0) (Position 999 999)
+
 goldenWithRange :: TestName -> FilePath -> Range -> TestTree
 goldenWithRange title path range =
   goldenWithHaskellDocInTmpDir def caseSplitPlugin title (mkFs $ FS.directProject (path <.> "hs")) path "expected" "hs" $ \doc -> do
@@ -155,18 +187,6 @@ goldenWithClass title path findAction =
     actions <- getAllCodeActions doc
     action <- liftIO $ findAction actions
     executeCodeAction action
-
-expectNoCodeActionAvailable :: TestName -> FilePath -> TestTree
-expectNoCodeActionAvailable title path =
-  testCase title $ do
-    runSessionWithServerInTmpDir def caseSplitPlugin (mkFs $ FS.directProject (path <.> "hs")) $ do
-      doc <- openDoc (path <.> "hs") "haskell"
-      _ <- waitForDiagnosticsFrom doc
-      caResults <- getAllCodeActions doc
-      liftIO $ map (^? _CACodeAction . L.title) caResults
-        @?= expectedActions
-    where
-      expectedActions = []
 
 testDataDir :: FilePath
 testDataDir = "plugins" </> "hls-case-split-plugin" </> "test" </> "testdata"

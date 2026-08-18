@@ -8,10 +8,10 @@
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE ViewPatterns      #-}
 
-{- | Note [Implementation strategy]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- | __Implementation strategy__
+
   The present plugin achieves its target of appending the missing patterns to a
-  non-exhaustive @case@ (or @\case@) expression via the following strategy:
+  non-exhaustive @case@ (or @\\case@) expression via the following strategy:
 
     1. the HLS utility 'activeDiagnosticsInRange' retrieves the
        @['FileDiagnostic']@ under the cursor,
@@ -36,7 +36,7 @@
        purpose of
 
           - pinpointing the one node representing the innermost @case@ (or
-            @\case@) expression encompassing the cursor position,
+            @\\case@) expression encompassing the cursor position,
 
                 - in this phase, the relevant @case@ expression is parsed
                   for detecting the current layout (whether the existing
@@ -96,7 +96,7 @@ import           Development.IDE                       (FileDiagnostic (fdStruct
                                                         HscEnvEq (hscEnv),
                                                         IdeState (shakeExtras),
                                                         Pretty (pretty),
-                                                        Range (Range, _start),
+                                                        Range (Range, _end, _start),
                                                         Recorder, WithPriority,
                                                         runAction,
                                                         spanContainsRange)
@@ -220,29 +220,9 @@ descriptor recorder plId = (defaultPluginDescriptor plId "Provides the split cas
 caseSplitPluginCodeActionTitle :: Text
 caseSplitPluginCodeActionTitle = "Add placeholders for missing patterns"
 
--- | The '_range' from a 'CodeActionParams' seems to refer to the cursor
--- as a 1-character long 'Range', e.g. @'Range' ('Position' n 0) ('Position' n 1)@
--- represents the cursor at the 0th (i.e. 0-based first) column of the 0-based
--- @n@th line.
---
--- However, this 'Range' seems to behave strangely, and the net effect is the following:
---
---   - given a snippet where @code something of@ is **at the end of a line**,
---   - and the cursor on the `o` or `f` of `of`,
---
--- the '_range' will actually end at the beginning of the following line, which
--- means that the case-split plugin won't present its action.
---
--- The workaround is to use only the '_start' of the 'Range'.
---
--- See also https://github.com/haskell/haskell-language-server/issues/5046 for
--- more info.
-workaround :: Range -> Range
-workaround Range { _start } = Range _start _start
-
 suggestCaseSplitProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'Method_TextDocumentCodeAction
 suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument
-                                                          , _range = workaround -> cursor }
+                                                          , _range = rangeToPointRange -> cursor }
   = do
 
   nfp <- getNormalizedFilePathE $ _textDocument ^. L.uri
@@ -285,6 +265,26 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument
                        , _command     = Nothing
                        , _data_       = Nothing }
 
+-- | An LSP @'Range' { '_start', '_end' }@ represents a closed-open interval
+-- (i.e. it includes '_start' but excludes '_end').
+--
+-- 'SrcSpan's represent a closed interval, so it includes both ends.
+--
+-- In other words, 'Range' and 'SrcSpan' use a different format, and the
+-- consequence is that in order to tell whether the 'Range' representing the
+-- cursor lies inside a 'SrcSpan', we'd need to convert either operand to the
+-- format of the other.  Doing so would require some information about the
+-- file, specifically the length of its lines, because an exclusive 'Range'
+-- with @'_end' = 'Position' { '_line' = m+1, '_character' = 0 }@ is made
+-- inclusive by setting @'_end' = 'Position' { '_line' = m, '_character' = n
+-- }@, where @n@ is the length of the 0-based @m@th line.
+--
+-- This function does something much simpler: given a 'Range', it returns
+-- another 'Range' that '_start's and '_end's at the '_start' of given 'Range'.
+-- This represents a 0-length 'Range' and checking if it's inside a 'SrcSpan'
+-- poses no ambiguities.
+rangeToPointRange :: Range -> Range
+rangeToPointRange r@Range{..} = r { _end = _start }
 
 -- | Retrieve 'VersionedTextDocumentIdentifier' from the handler.
 getVerTxtDocId :: IdeState -> TextDocumentIdentifier -> HandlerM Config VersionedTextDocumentIdentifier
@@ -374,7 +374,7 @@ nablasToPmAlts identifier nablas = fmap concat $ traverse go nablas
 
 -- | Given a 'ParsedSource' and a 'Range' representing the cursor position into
 -- it, this function uses a bottom-up traversal of the AST to detect the
--- innermost @case@/@\case@ expression encompassing the cursor's 'Range', and
+-- innermost @case@/@\\case@ expression encompassing the cursor's 'Range', and
 -- it appends the 'MissingPatterns' to the existing ones, if any, using the
 -- syntax @->@ or @→@ depending on the provided 'IsUnicodeSyntax'. The new
 -- 'ParsedSource' is returned in the 'Maybe' monad to account for failure.
@@ -420,7 +420,7 @@ graftMissingPatterns ps cursor missingPs arrowSyntax
       inSpan range s = fromMaybe False $ s `spanContainsRange` range
 
 -- | While @HsExpr GhcPs@ can contain any expression, the following refined
--- type can only contain a @case@ or a @\case@ expression.
+-- type can only contain a @case@ or a @\\case@ expression.
 data CaseLikeExpr = Case       (XCase GhcPs) (LHsExpr GhcPs) (MatchGroup GhcPs (LHsExpr GhcPs))
                   | LambdaCase (XLam  GhcPs)                 (MatchGroup GhcPs (LHsExpr GhcPs))
 
@@ -491,7 +491,7 @@ getMatchesLayout (MG { mg_alts = L altsLoc existingMatches })
         -> let indent = fstExistingMatchCol - openingBraceCol
            in Braced $ SomeMatches indent
 
--- | Given a @case@ or @\case@ expression wrapped in the refined 'CaseLikeExpr'
+-- | Given a @case@ or @\\case@ expression wrapped in the refined 'CaseLikeExpr'
 -- type and a 'MatchGroup', it creates an actual corresponding @HsExpr GhcPs@
 -- with that 'MatchGroup' in it.
 setMatches :: CaseLikeExpr -> MatchGroup GhcPs (LHsExpr GhcPs) -> HsExpr GhcPs
