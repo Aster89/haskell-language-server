@@ -1,6 +1,6 @@
 {-# LANGUAGE EmptyCase #-}
 {-# OPTIONS_GHC -Wall -fmax-uncovered-patterns=99 #-}
-module TManyFields where
+module T where
 
 data X = A
        | B Int

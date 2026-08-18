@@ -1,7 +1,7 @@
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE UnicodeSyntax #-}
 {-# OPTIONS_GHC -Wall -fmax-uncovered-patterns=99 #-}
-module T1 where
+module T where
 
 data X = A
        | B

@@ -1,7 +1,7 @@
 {-# LANGUAGE EmptyCase #-}
 {-# OPTIONS_GHC -Wall -fmax-uncovered-patterns=99 #-}
 {-# LANGUAGE GADTs #-}
-module T1 where
+module T where
 
 data Expr a where
     LitInt :: Int -> Expr Int
