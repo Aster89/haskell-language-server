@@ -291,7 +291,7 @@ subRange = isSubrangeOf
 -- True
 rangesOverlap :: Range -> Range -> Bool
 rangesOverlap r1 r2 =
-  r1 ^. L.start <= r2 ^. L.end && r2 ^. L.start <= r1 ^. L.end
+  r1 ^. L.start < r2 ^. L.end && r2 ^. L.start < r1 ^. L.end
 
 -- ---------------------------------------------------------------------
 
