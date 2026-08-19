@@ -118,7 +118,8 @@ codeActionTests = testGroup
   -- Extreme cursor positions
   , expectCodeActionsAvailable "Cursor before `c` of `case`" "TNoPatternsNoBraces"
       (Range (Position 12 7) (Position 12 8))
-      []
+      [ CS.caseSplitPluginCodeActionTitle
+      ]
 
   , expectCodeActionsAvailable "Cursor on `c` of `case`" "TNoPatternsNoBraces"
       (Range (Position 12 8) (Position 12 9))

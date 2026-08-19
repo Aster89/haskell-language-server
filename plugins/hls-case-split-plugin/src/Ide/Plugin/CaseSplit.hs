@@ -5,6 +5,7 @@
 {-# LANGUAGE OrPatterns        #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE TemplateHaskell   #-}
 {-# LANGUAGE TypeFamilies      #-}
 {-# LANGUAGE ViewPatterns      #-}
 
@@ -66,7 +67,8 @@ module Ide.Plugin.CaseSplit
 
 import           Control.Applicative                   (ZipList (ZipList, getZipList))
 import           Control.Arrow                         ((&&&))
-import           Control.Lens                          ((^.), (^?))
+import           Control.Lens                          (makeLenses, over, (^.),
+                                                        (^?))
 import           Control.Monad                         ((>=>))
 import           Control.Monad.IO.Class                (MonadIO (liftIO))
 import           Control.Monad.State.Strict            (MonadState (get, put),
@@ -196,6 +198,7 @@ import           Language.LSP.Protocol.Types           (ClientCapabilities,
                                                         CodeActionParams (CodeActionParams, _range, _textDocument),
                                                         Diagnostic,
                                                         NormalizedFilePath,
+                                                        Position,
                                                         TextDocumentIdentifier,
                                                         VersionedTextDocumentIdentifier,
                                                         WorkspaceEdit,
@@ -205,6 +208,7 @@ import qualified Language.LSP.Protocol.Types           as Diag (Diagnostic (_ran
 import           Type.Reflection                       (eqTypeRep,
                                                         type (:~~:) (HRefl),
                                                         typeOf, typeRep)
+makeLenses ''Position
 
 data Log where
   LogPatternNotSupportedYet :: String -> Log
@@ -284,7 +288,7 @@ suggestCaseSplitProvider recorder state _ CodeActionParams{ _textDocument
 -- This represents a 0-length 'Range' and checking if it's inside a 'SrcSpan'
 -- poses no ambiguities.
 rangeToPointRange :: Range -> Range
-rangeToPointRange r@Range{..} = r { _end = _start }
+rangeToPointRange r@Range{..} = r { _end = over character (+1) _start }
 
 -- | Retrieve 'VersionedTextDocumentIdentifier' from the handler.
 getVerTxtDocId :: IdeState -> TextDocumentIdentifier -> HandlerM Config VersionedTextDocumentIdentifier
