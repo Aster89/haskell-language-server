@@ -20,9 +20,12 @@ import           Ide.Plugin.Properties       (KeyNamePath (..),
                                               usePropertyByPath,
                                               usePropertyByPathEither)
 import qualified Ide.Plugin.RangeMap         as RangeMap
-import           Ide.PluginUtils             (extractTextInRange, unescape, diffTextEdit, WithDeletions (IncludeDeletions))
+import           Ide.PluginUtils             (WithDeletions (IncludeDeletions),
+                                              diffTextEdit, extractTextInRange,
+                                              unescape)
 import           Language.LSP.Protocol.Types (Position (..), Range (Range),
-                                              UInt, isSubrangeOf, TextEdit(TextEdit), mkRange)
+                                              TextEdit (TextEdit), UInt,
+                                              isSubrangeOf, mkRange)
 import           Test.Tasty
 import           Test.Tasty.Golden           (goldenVsStringDiff)
 import           Test.Tasty.HUnit
