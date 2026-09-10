@@ -237,8 +237,9 @@ setupDynFlagsForGHCiLike env dflags = do
     Loader.initializePlugins (hscSetFlags dflags4 env)
 
 adjustToRange :: Uri -> Range -> WorkspaceEdit -> WorkspaceEdit
-adjustToRange uri ran (WorkspaceEdit mhult mlt x) =
-    WorkspaceEdit (adjustWS <$> mhult) (fmap adjustDoc <$> mlt) x
+adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
+    wsEdit { _changes = adjustWS <$> _changes
+           , _documentChanges = fmap adjustDoc <$> _documentChanges }
     where
         adjustTextEdits :: Traversable f => f TextEdit -> f TextEdit
         adjustTextEdits eds =
@@ -257,6 +258,7 @@ adjustToRange uri ran (WorkspaceEdit mhult mlt x) =
                 in InR $ AnnotatedTextEdit{_range,_newText,_annotationId}
 
         adjustWS = ix uri %~ adjustTextEdits
+
         adjustDoc :: DocumentChange -> DocumentChange
         adjustDoc (InR es) = InR es
         adjustDoc (InL es)
