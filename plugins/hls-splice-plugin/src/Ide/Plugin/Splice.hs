@@ -252,10 +252,11 @@ adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
         adjustATextEdits :: Traversable f => f (TextEdit |? AnnotatedTextEdit) -> f (TextEdit |? AnnotatedTextEdit)
         adjustATextEdits = fmap $ \case
           InL t -> InL $ runIdentity $ adjustTextEdits (Identity t)
-          InR AnnotatedTextEdit{_range, _newText, _annotationId} ->
-            let oldTE = TextEdit{_range,_newText}
-              in let TextEdit{_range,_newText} = runIdentity $ adjustTextEdits (Identity oldTE)
-                in InR $ AnnotatedTextEdit{_range,_newText,_annotationId}
+          InR ate@AnnotatedTextEdit{ _annotationId } ->
+               InR $ annotate (runIdentity $ adjustTextEdits $ Identity $ unannotate ate) _annotationId
+          where
+            unannotate AnnotatedTextEdit{..} = TextEdit _range _newText
+            annotate TextEdit{..} anno = AnnotatedTextEdit _range _newText anno
 
         adjustWS = ix uri %~ adjustTextEdits
 
