@@ -243,11 +243,11 @@ adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
     where
         adjustTextEdits :: Traversable f => f TextEdit -> f TextEdit
         adjustTextEdits eds =
-            let minStart =
-                    case L.fold (L.premap (view J.range) L.minimum) eds of
+            let minStart :: Range -- leftmost-starting range or, to break ties, leftmost-ending range
+                 = case L.fold (L.premap (view J.range) L.minimum) eds of
                         Nothing -> error "impossible"
                         Just v  -> v
-            in adjustLine minStart <$> eds
+            in adjustLine ran minStart <$> eds
 
         adjustATextEdits :: Traversable f => f (TextEdit |? AnnotatedTextEdit) -> f (TextEdit |? AnnotatedTextEdit)
         adjustATextEdits = fmap $ \case
@@ -267,10 +267,10 @@ adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
                 InL $ es & J.edits %~ adjustATextEdits
             | otherwise = InL es
 
-        adjustLine :: Range -> TextEdit -> TextEdit
-        adjustLine bad =
-            J.range %~ \r ->
-                if r == bad then ran else bad
+adjustLine :: Range -> Range -> TextEdit -> TextEdit
+adjustLine Range{ _start = s } bad@Range{ _end = e } =
+   J.range %~ \r ->
+       if r == bad then Range s e else bad
 
 -- Define a pattern to get hold of a `SrcSpan` from the location part of a
 -- `GenLocated`. In GHC >= 9.2 this will be a SrcSpanAnn', with annotations;
