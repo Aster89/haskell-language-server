@@ -17,7 +17,7 @@ import           Control.Arrow                         (Arrow (first))
 import           Control.Exception                     (SomeException)
 import qualified Control.Foldl                         as L
 import           Control.Lens                          (Identity (..), ix, view,
-                                                        (%~), (<&>), (^.))
+                                                        (%~), (<&>), (^.), (.~))
 import           Control.Monad                         (forM, guard, unless)
 import           Control.Monad.Error.Class             (MonadError (throwError))
 import           Control.Monad.Extra                   (eitherM)
@@ -247,7 +247,7 @@ adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
                  = case L.fold (L.premap (view J.range) L.minimum) eds of
                         Nothing -> error "impossible"
                         Just v  -> v
-            in adjustLine ran minStart <$> eds
+            in adjustLine minStart <$> eds
 
         adjustATextEdits :: Traversable f => f (TextEdit |? AnnotatedTextEdit) -> f (TextEdit |? AnnotatedTextEdit)
         adjustATextEdits = fmap $ \case
@@ -267,10 +267,12 @@ adjustToRange uri ran wsEdit@WorkspaceEdit{..} =
                 InL $ es & J.edits %~ adjustATextEdits
             | otherwise = InL es
 
-adjustLine :: Range -> Range -> TextEdit -> TextEdit
-adjustLine Range{ _start = s } bad@Range{ _end = e } =
-   J.range %~ \r ->
-       if r == bad then Range s e else bad
+        adjustLine :: Range -> TextEdit -> TextEdit
+        adjustLine bad =
+           J.range %~ \r ->
+               if r == bad
+                 then bad & J.start .~ ran ^. J.start
+                 else bad
 
 -- Define a pattern to get hold of a `SrcSpan` from the location part of a
 -- `GenLocated`. In GHC >= 9.2 this will be a SrcSpanAnn', with annotations;
