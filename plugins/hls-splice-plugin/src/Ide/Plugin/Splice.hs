@@ -17,7 +17,7 @@ import           Control.Arrow                         (Arrow (first))
 import           Control.Exception                     (SomeException)
 import qualified Control.Foldl                         as L
 import           Control.Lens                          (Identity (..), ix, view,
-                                                        (%~), (<&>), (^.), (.~))
+                                                        (%~), (.~), (<&>), (^.))
 import           Control.Monad                         (forM, guard, unless)
 import           Control.Monad.Error.Class             (MonadError (throwError))
 import           Control.Monad.Extra                   (eitherM)
@@ -61,7 +61,8 @@ import           Data.Foldable                         (Foldable (foldl'))
 import           GHC.Data.Bag                          (Bag)
 
 #if MIN_VERSION_ghc(9,13,0)
-import           GHC.Parser.Annotation                 (EpAnn (..), EpToken (..))
+import           GHC.Parser.Annotation                 (EpAnn (..),
+                                                        EpToken (..))
 #elif MIN_VERSION_ghc(9,9,0)
 import           GHC.Parser.Annotation                 (EpAnn (..))
 #else
